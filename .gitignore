@@ -1,0 +1,13 @@
+output*
+*db
+annotator_app*
+data/*
+label-studio*
+sed_project*
+setup*
+*mp3
+*png
+*jpg
+*wenet*
+*cache*
+logs*
