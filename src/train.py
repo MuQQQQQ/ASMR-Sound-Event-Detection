@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data import SEDWindowDataset, split_files
+from data import RandomFileSubsetBatchSampler, SEDWindowDataset, split_files
 from model import EMA, ResNetConformerSED, UNetConformerSED
 from utils import build_label_map, load_annotations, save_checkpoint, save_json
 
@@ -77,20 +77,16 @@ def get_cosine_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda)
 
 
-# 针对 Windows 环境下 VS Code 调试器找不到 CUDA DLL 的修复
-if platform.system() == "Windows":
-    # 填入你刚才确认的路径
-    conda_bin_custom = r"C:\Users\11703\AppData\Local\miniconda3\envs\py39\bin"
+# if platform.system() == "Windows":
+#     conda_bin_custom = r"C:\Users\11703\AppData\Local\miniconda3\envs\py310\Library\bin"
 
-    if os.path.exists(conda_bin_custom):
-        # 核心：告诉 Python 解释器去哪里找 DLL
-        os.add_dll_directory(conda_bin_custom)
-        # 兼容性补充：同时更新环境变量
-        os.environ['PATH'] = conda_bin_custom + os.pathsep + os.environ['PATH']
-        print(f"成功挂载 DLL 路径: {conda_bin_custom}")
-    else:
-        print("警告：指定的 Conda bin 路径不存在，请检查路径是否正确。")
-matplotlib.use('Agg')  # 使用 Agg 后端，只负责生成图片文件，不弹出窗口
+#     if os.path.exists(conda_bin_custom):
+#         os.add_dll_directory(conda_bin_custom)
+#         os.environ['PATH'] = conda_bin_custom + os.pathsep + os.environ['PATH']
+#         print(f"成功挂载 DLL 路径: {conda_bin_custom}")
+#     else:
+#         print("警告：指定的 Conda bin 路径不存在，请检查路径是否正确。")
+# matplotlib.use('Agg')
 
 
 def set_seed(seed: int):
@@ -103,6 +99,7 @@ def set_seed(seed: int):
 
 def build_model(args, num_classes: int, device: str):
     """Build model instance from command-line arguments."""
+    audio_channels = 2 if args.audio_mode == "stereo" else 1
     if args.model_type == "resnet":
         return ResNetConformerSED(
             num_classes=num_classes,
@@ -116,6 +113,7 @@ def build_model(args, num_classes: int, device: str):
             win_length=args.win_length,
             hop_length=args.hop_length,
             n_mels=args.n_mels,
+            audio_channels=audio_channels,
         ).to(device)
 
     return UNetConformerSED(
@@ -125,6 +123,7 @@ def build_model(args, num_classes: int, device: str):
         freq_mask_param=args.freq_mask_param,
         time_mask_param=args.time_mask_param,
         feature_extractor=args.feature_extractor,
+        audio_channels=audio_channels,
     ).to(device)
 
 
@@ -177,7 +176,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None, lr_scheduler=Non
     pbar = tqdm(loader, desc="train" if training else "val", leave=False)
     for batch in pbar:
 
-        x = batch["waveform"].to(device)  # [B, S]
+        x = batch["waveform"].to(device)  # [B, S] or [B, 2, S]
         y = batch["target"].to(device)  # [B, T, C]
 
         autocast_ctx = (
@@ -294,8 +293,20 @@ def main():
     ap.add_argument("--win_length", type=int, default=1024)
     ap.add_argument("--n_mels", type=int, default=64)
     ap.add_argument("--hop_length", type=int, default=320)
+    ap.add_argument("--audio_mode", type=str, default="stereo",
+                    choices=["mono", "stereo"])
+
+    ap.add_argument("--use_lazy_loading", action="store_true", default=True,
+                    help="Enable lazy loading (load windows on demand)")
+    ap.add_argument("--files_per_batch", type=int, default=60,
+                    help="If >0, each train batch is sampled from this many random audio files")
+    ap.add_argument("--batches_per_group", type=int, default=4,
+                    help="When using --files_per_batch, number of batches to sample before reshuffling files")
     args = ap.parse_args()
 
+    args.batches_per_group = int(0.5*args.files_per_batch *
+                                 args.windows_per_file // args.batch_size)
+    print(f"Calculated batches_per_group: {args.batches_per_group}")
     current_time = time.localtime()
     log_dir = os.path.join(
         args.log_dir, time.strftime("%Y%m%d-%H%M%S", current_time))
@@ -326,9 +337,9 @@ def main():
     files = sorted(df["filename"].unique().tolist())
     train_files, val_files = split_files(
         files, val_ratio=args.val_ratio, seed=args.seed)
-    train_files = ['out000.mp3', 'out001.mp3', 'out003.mp3',
-                   'out004.mp3', 'out005.mp3', 'out006.mp3']
-    val_files = ['out002.mp3', 'out007.mp3']
+    # train_files = ['out000.mp3', 'out001.mp3', 'out003.mp3',
+    #                'out004.mp3', 'out005.mp3', 'out006.mp3']
+    # val_files = ['out002.mp3', 'out007.mp3']
     print(f"Classes ({len(label_to_idx)}): {list(label_to_idx.keys())}")
     print(f"Train files: {train_files}")
     print(f"Val files: {val_files}")
@@ -344,6 +355,8 @@ def main():
         windows_per_file=args.windows_per_file,
         training=True,
         seed=args.seed,
+        audio_mode=args.audio_mode,
+        use_lazy_loading=args.use_lazy_loading,
     )
     val_ds = SEDWindowDataset(
         data_dir=args.data_dir,
@@ -358,13 +371,29 @@ def main():
         seed=args.seed,
         full_audio_eval=True,
         eval_hop_sec=10,
+        audio_mode=args.audio_mode,
+        use_lazy_loading=False,
     )
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    if args.files_per_batch > 0:
+        train_batch_sampler = RandomFileSubsetBatchSampler(
+            dataset=train_ds,
+            batch_size=args.batch_size,
+            files_per_batch=args.files_per_batch,
+            batches_per_group=args.batches_per_group,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_batch_sampler,
+            num_workers=0,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
+    train_loader.dataset.use_mixup = False
     model = build_model(args, num_classes=len(label_to_idx), device=device)
     # ckpt = torch.load(
     #     r'logs\20260401-000923\best_checkpoint.pth', map_location='cpu')
@@ -393,6 +422,7 @@ def main():
     for ep in range(1, args.epochs + 1):
         if ep > 0.7*args.epochs:
             model.use_specaug = False
+            train_loader.dataset.use_mixup = False
         tr, train_acc = run_epoch(model, train_loader, criterion,
                                   device, optimizer=optimizer, lr_scheduler=lr_scheduler, amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler, ema=ema if args.use_ema else None)
 
@@ -420,7 +450,10 @@ def main():
                 "label_to_idx": label_to_idx,
                 "idx_to_label": idx_to_label,
                 "sample_rate": args.sample_rate,
+                "frame_hop_sec": args.frame_hop_sec,
                 "window_sec": args.window_sec,
+                "audio_mode": args.audio_mode,
+                "audio_channels": (2 if args.audio_mode == "stereo" else 1),
                 "history": history,
             }
 

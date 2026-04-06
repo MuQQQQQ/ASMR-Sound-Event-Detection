@@ -1,10 +1,11 @@
+
 <a id="top"></a>
 
 # ASMR Sound Event Detection
 
 <p>
   <a href="#english"><button>English</button></a>
-  <a href="#chinese"><button>中文</button></a>
+  <a href="#chinese"><button>简体中文</button></a>
 </p>
 
 ---
@@ -13,27 +14,120 @@
 
 ## English
 
-This project provides a full workflow for **training** and **inference** of a frame-level Sound Event Detection model focused on ASMR audio.
+This repository provides an end-to-end pipeline for **training** and **inference** of a **frame-level Sound Event Detection (SED)** model tailored for ASMR audio.
 
-Labels include:
-- Speech
-- Chewing
-- Mouth sounds
-- Scraping (not currently included in training data)
-- Tapping (not currently included in training data)
+### Supported Event Labels
 
-Core code is under `src/`:
-
-- `src/train.py`: model training entry point
-- `src/infer_and_visualize.py`: inference + timeline visualization + Label Studio export
-- `src/data.py`: dataset and split logic
-- `src/model.py`: model definitions (ResNet/UNet + Conformer) and EMA
-- `src/utils.py`: shared helpers
-- `src/convert_labels.py`: convert Label Studio JSON annotations to CSV
+* Speech
+* Chewing
+* Mouth sounds
+* Scraping *(currently not included in training data)*
+* Tapping *(currently not included in training data)*
 
 ---
 
-### 1) Environment Setup
+## Project Structure
+
+Core implementation is located in `src/`:
+
+* `train.py` — training entry point
+* `infer_and_visualize.py` — inference, timeline visualization, and Label Studio export
+* `data.py` — dataset handling and split logic
+* `model.py` — model definitions (ResNet + Conformer) and EMA
+* `utils.py` — shared utilities
+* `convert_labels.py` — convert Label Studio JSON annotations to CSV
+
+---
+
+## Model Architecture
+
+The model follows a lightweight **ResNet + Conformer** design for frame-wise prediction.
+
+### Input
+
+* `waveform`: **[B, S]**
+  *(batch size, number of audio samples)*
+
+---
+
+### Feature Extraction
+
+Using `torchaudio.transforms.MelSpectrogram`:
+
+* Key parameters: `n_fft`, `win_length`, `hop_length`, `n_mels`, `sample_rate`
+* Output: **[B, M, T]**
+  *(batch size, mel bins, time frames)*
+
+---
+
+### ResNet Backbone
+
+Input: `x ∈ [B, M, T]`
+
+1. Expand channel dimension
+   → `[B, 1, M, T]`
+
+2. Stem:
+
+   * Conv2d(1 → 32, kernel=3, stride=1, padding=1)
+   * BatchNorm + ReLU
+
+3. Residual blocks:
+
+   * `ResBlock2D(32, 64, stride=(2,1))`
+   * `ResBlock2D(64, 128, stride=(2,1))`
+   * `ResBlock2D(128, 128, stride=(1,1))`
+
+Output: **[B, 128, M/4, T]**
+
+#### Frequency Pooling
+
+* Mean over frequency → `[B, 128, T]`
+* Transpose → `[B, T, 128]`
+
+This converts 2D time-frequency features into a temporal sequence.
+
+---
+
+### Projection Layer
+
+* `Linear(128 → conformer_dim) + Dropout`
+* `conformer_dim = 256`
+
+Output: **[B, T, 256]**
+
+---
+
+### Conformer Encoder
+
+Stack of **4 Conformer blocks**, each including:
+
+1. Feed-forward module (half residual)
+2. Multi-head self-attention
+3. Convolution module:
+
+   * LayerNorm → pointwise Conv1d → GLU
+   * Depthwise Conv1d
+   * BatchNorm + SiLU
+   * Pointwise Conv1d + Dropout
+4. Second feed-forward module
+5. Final LayerNorm
+
+Output shape remains: **[B, T, 256]**
+
+---
+
+### Frame-wise Classifier
+
+* `Linear(256 → num_classes)`
+
+Output:
+
+* Logits: **[B, T, C]**
+
+---
+
+## 1. Environment Setup
 
 Install dependencies:
 
@@ -41,20 +135,22 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Any Python version should work.
+Most modern Python versions should work.
 
 ---
 
-### 2) Data and Annotation Format
+## 2. Data Format
 
-Audio files are typically placed in `data/`.
+Audio files should be placed in `data/`.
 
-Training annotation CSV must contain these columns:
+### Annotation CSV format
 
-- `filename`
-- `start_time` (in seconds)
-- `end_time` (in seconds)
-- `event_label`
+Required columns:
+
+* `filename`
+* `start_time` (seconds)
+* `end_time` (seconds)
+* `event_label`
 
 Example:
 
@@ -66,9 +162,9 @@ out000.mp3,4.00,4.60,Speech
 
 ---
 
-### 3) Training
+## 3. Training
 
-Basic training command:
+Basic command:
 
 ```bash
 python src/train.py \
@@ -79,27 +175,42 @@ python src/train.py \
   --lr 1e-4
 ```
 
-You can pass several annotation files via `--annotations data/anno1.csv,data/anno2.csv,data/anno3.csv` (comma-separated). All audio files must be in the same `data_dir`.
+### Multiple annotation files
 
-Useful options:
+```bash
+--annotations data/a.csv,data/b.csv,data/c.csv
+```
 
-- `--use_ema` to enable EMA
-- `--loss_type {bce,focal}`
-- `--lr_scheduler {cosine,step,custom,none}`
-- `--amp` mixed precision control
-
-Training outputs are written to timestamped folders under `logs/`, including:
-
-- `best_checkpoint.pth`
-- `history.json`
-- `loss_curves.png`
-- `config.txt`
+> All referenced audio files must reside in the same `data_dir`.
 
 ---
 
-### 4) Inference and Visualization
+### Useful options
 
-#### Single audio file
+* `--use_ema` — enable EMA
+* `--loss_type {bce,focal}`
+* `--lr_scheduler {cosine,step,custom,none}`
+* `--amp` — mixed precision
+* `--audio_mode {mono,stereo}` — audio channel mode (stereo loads each clip as 2 channels)
+* `--use_lazy_loading` — use lazy loading 
+* `--files_per_batch N` — each batch samples windows only from `N` random audio files
+
+---
+
+### Training Outputs
+
+Saved under `logs/<timestamp>/`:
+
+* `best_checkpoint.pth`
+* `history.json`
+* `loss_curves.png`
+* `config.txt`
+
+---
+
+## 4. Inference & Visualization
+
+### Single file
 
 ```bash
 python src/infer_and_visualize.py \
@@ -108,7 +219,7 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
-#### Batch directory inference
+### Batch inference
 
 ```bash
 python src/infer_and_visualize.py \
@@ -117,35 +228,46 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
-Optional:
+---
 
-- `--save_pred_clips` to export predicted event clips by class
-- `--pred_json` to customize plain prediction JSON name
-- `--pred_labelstudio_json` to customize Label Studio prediction JSON name
+### Optional arguments
 
-Inference outputs in `outputs/` include:
-
-- `*_timeline.png` (waveform + GT + prediction timeline)
-- `pred_spans.json`
-- `labelstudio.json`
-- optional `pred_clips/`
+* `--save_pred_clips` — export predicted clips by class
+* `--pred_json` — custom prediction JSON filename
+* `--pred_labelstudio_json` — custom Label Studio JSON filename
+* `--audio_mode {auto,mono,stereo}` — inference audio mode
+  * `auto`: follow checkpoint training setting
+  * `mono`/`stereo`: manually override
 
 ---
 
-### 5) Convert Label Studio JSON to CSV
+### Outputs
 
-If your annotations come from Label Studio:
+Saved in `outputs/`:
+
+* `*_timeline.png` — waveform + GT + predictions
+* `pred_spans.json`
+* `labelstudio.json`
+* `pred_clips/` *(optional)*
+
+---
+
+## 5. Convert Label Studio JSON to CSV
 
 ```bash
-python src/convert_labels.py --input data/<label_studio_file>.json --output data/<output_file>.csv
+python src/convert_labels.py \
+  --input data/<label_studio_file>.json \
+  --output data/<output_file>.csv
 ```
 
-This generates a training-ready CSV with columns:
+Generated CSV contains:
 
-- `filename`
-- `start_time`
-- `end_time`
-- `event_label`
+* `filename`
+* `start_time`
+* `end_time`
+* `event_label`
+
+---
 
 <p><a href="#top"><button>Back to Top</button></a></p>
 
@@ -153,50 +275,130 @@ This generates a training-ready CSV with columns:
 
 <a id="chinese"></a>
 
-## 中文
+## 简体中文
 
-本项目提供了一个完整流程，用于对 ASMR 音频进行帧级声音事件检测模型的**训练**与**推理**。
-
-标签类别包括：
-- Speech（轻语）
-- Chewing（咀嚼声）
-- Mouth sounds（口腔音）
-- Scraping（刮擦，当前训练数据中暂未包含）
-- Tapping（敲击，当前训练数据中暂未包含）
-
-核心代码位于 `src/`：
-
-- `src/train.py`：模型训练入口
-- `src/infer_and_visualize.py`：推理 + 时间轴可视化 + Label Studio 格式导出
-- `src/data.py`：数据集与数据划分逻辑
-- `src/model.py`：模型定义（ResNet/UNet + Conformer）与 EMA
-- `src/utils.py`：通用辅助函数
-- `src/convert_labels.py`：将 Label Studio 的 JSON 标注转换为 CSV
+本项目提供了一套完整的流程，用于对 **ASMR 音频进行帧级声音事件检测（Sound Event Detection, SED）模型的训练与推理**。
 
 ---
 
-### 1）环境安装
+### 支持的事件类别
 
-安装依赖：
+* 语音（Speech）
+* 咀嚼声（Chewing）
+* 口腔音（Mouth sounds）
+* 刮擦声（Scraping，当前未用于训练）
+* 敲击声（Tapping，当前未用于训练）
+
+---
+
+## 项目结构
+
+核心代码位于 `src/` 目录：
+
+* `train.py` —— 训练入口
+* `infer_and_visualize.py` —— 推理、时间轴可视化及 Label Studio 导出
+* `data.py` —— 数据加载与划分逻辑
+* `model.py` —— 模型定义（ResNet + Conformer）及 EMA
+* `utils.py` —— 通用工具函数
+* `convert_labels.py` —— 将 Label Studio JSON 转换为 CSV
+
+---
+
+## 模型结构
+
+模型采用轻量级 **ResNet + Conformer** 架构，实现帧级预测。
+
+---
+
+### 输入
+
+* `waveform`：形状 **[B, S]**
+  （批大小，音频采样点数）
+
+---
+
+### 特征提取
+
+使用 `MelSpectrogram`：
+
+* 关键参数：`n_fft`、`win_length`、`hop_length`、`n_mels`、`sample_rate`
+* 输出：**[B, M, T]**（批大小 × 梅尔频带 × 时间帧）
+
+---
+
+### ResNet 主干
+
+输入：`[B, M, T]`
+
+处理流程：
+
+1. 扩展通道 → `[B, 1, M, T]`
+2. 卷积 Stem（Conv + BN + ReLU）
+3. 三个残差块（逐步压缩频率维）
+
+输出： **[B, 128, M/4, T]**
+
+#### 频率维池化
+
+* 对频率维取均值 → `[B, 128, T]`
+* 转置 → `[B, T, 128]`
+
+将时频特征转换为时间序列特征
+
+---
+
+### 投影层
+
+* `Linear(128 → 256) + Dropout`
+
+输出： **[B, T, 256]**
+
+---
+
+### Conformer 编码器
+
+包含 4 个 Conformer Block，每个 Block 包括：
+
+1. 前馈网络（半残差）
+2. 多头自注意力
+3. 卷积模块（GLU + 深度可分离卷积等）
+4. 第二个前馈网络
+5. LayerNorm
+
+输出维度保持不变：**[B, T, 256]**
+
+---
+
+### 帧级分类器
+
+* `Linear(256 → 类别数)`
+
+输出： **[B, T, C]**
+
+---
+
+## 1. 环境安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-任意 Python 版本通常都可以运行。
+支持大多数 Python 版本。
 
 ---
 
-### 2）数据与标注格式
+## 2. 数据格式
 
-音频文件放在 `data/` 目录下。
+音频文件放置于 `data/` 目录。
 
-训练标注 CSV 必须包含以下列：
+### 标注 CSV 格式
 
-- `filename`
-- `start_time`（单位：秒）
-- `end_time`（单位：秒）
-- `event_label`
+必须包含以下字段：
+
+* `filename`
+* `start_time`（秒）
+* `end_time`（秒）
+* `event_label`
 
 示例：
 
@@ -208,9 +410,7 @@ out000.mp3,4.00,4.60,Speech
 
 ---
 
-### 3）训练
-
-基础训练命令：
+## 3. 模型训练
 
 ```bash
 python src/train.py \
@@ -221,27 +421,42 @@ python src/train.py \
   --lr 1e-4
 ```
 
-你也可以通过 `--annotations data/anno1.csv,data/anno2.csv,data/anno3.csv` 传入多个标注文件（用逗号分隔）。但所有音频文件必须位于同一个 `data_dir` 中。
+### 多标注文件
 
-常用可选参数：
+```bash
+--annotations data/a.csv,data/b.csv,data/c.csv
+```
 
-- `--use_ema`：启用 EMA
-- `--loss_type {bce,focal}`
-- `--lr_scheduler {cosine,step,custom,none}`
-- `--amp`：混合精度控制
-
-训练输出会写入 `logs/` 下按时间戳命名的目录，通常包括：
-
-- `best_checkpoint.pth`
-- `history.json`
-- `loss_curves.png`
-- `config.txt`
+> 所有音频必须位于同一个 `data_dir` 下
 
 ---
 
-### 4）推理与可视化
+### 常用参数
 
-#### 单个音频文件推理
+* `--use_ema`：启用 EMA
+* `--loss_type {bce,focal}`
+* `--lr_scheduler {cosine,step,custom,none}`
+* `--amp`：混合精度
+* `--audio_mode {mono,stereo}`：音频通道模式（stereo 会按双通道读取）
+* `--disable_lazy_loading`：懒加载
+* `--files_per_batch N`：每个 batch 仅从 `N` 个随机音频文件中采样窗口
+
+---
+
+### 输出结果
+
+保存在 `logs/<时间戳>/`：
+
+* `best_checkpoint.pth`
+* `history.json`
+* `loss_curves.png`
+* `config.txt`
+
+---
+
+## 4. 推理与可视化
+
+### 单文件
 
 ```bash
 python src/infer_and_visualize.py \
@@ -250,7 +465,7 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
-#### 批量目录推理
+### 批量推理
 
 ```bash
 python src/infer_and_visualize.py \
@@ -259,36 +474,45 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
-可选参数：
+---
 
-- `--save_pred_clips`：按类别导出预测到的事件片段
-- `--pred_json`：自定义普通预测 JSON 文件名
-- `--pred_labelstudio_json`：自定义 Label Studio 预测 JSON 文件名
+### 可选参数
 
-`outputs/` 中的推理结果包括：
-
-- `*_timeline.png`（波形 + GT + 预测时间轴）
-- `pred_spans.json`
-- `labelstudio.json`
-- 可选的 `pred_clips/`
+* `--save_pred_clips`：导出预测片段
+* `--pred_json`：自定义预测 JSON 名称
+* `--pred_labelstudio_json`：自定义 Label Studio JSON
+* `--audio_mode {auto,mono,stereo}`：推理音频模式
+  * `auto`：跟随 checkpoint 中训练配置
+  * `mono`/`stereo`：手动覆盖
 
 ---
 
-### 5）将 Label Studio JSON 转换为 CSV
+### 输出内容
 
-如果标注来自 Label Studio：
+位于 `outputs/`：
+
+* `*_timeline.png`（波形 + 标注 + 预测）
+* `pred_spans.json`
+* `labelstudio.json`
+* `pred_clips/`（可选）
+
+---
+
+## 5. Label Studio 转 CSV
 
 ```bash
-python src/convert_labels.py --input data/<label_studio_file>.json --output data/<output_file>.csv
+python src/convert_labels.py \
+  --input data/<label_studio_file>.json \
+  --output data/<output_file>.csv
 ```
 
-该命令会生成可直接用于训练的 CSV，包含以下列：
+生成训练用 CSV，包含：
 
-- `filename`
-- `start_time`
-- `end_time`
-- `event_label`
+* `filename`
+* `start_time`
+* `end_time`
+* `event_label`
+
+---
 
 <p><a href="#top"><button>返回顶部</button></a></p>
-
-test

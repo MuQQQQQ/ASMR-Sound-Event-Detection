@@ -45,14 +45,51 @@ def build_label_map(df: pd.DataFrame) -> Tuple[Dict[str, int], Dict[int, str]]:
     return label_to_idx, idx_to_label
 
 
-def load_audio_mono(path: str, target_sr: int) -> torch.Tensor:
-    """Load audio as tensor and optionally convert/resample to mono waveform."""
+def format_audio_channels(wav: torch.Tensor, audio_mode: str = "mono") -> torch.Tensor:
+    """Normalize raw waveform channels according to target audio mode.
+
+    Args:
+        wav: Tensor with shape [channels, samples].
+        audio_mode: "mono" or "stereo".
+
+    Returns:
+        mono   -> [samples]
+        stereo -> [2, samples]
+    """
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+
+    if audio_mode == "mono":
+        if wav.size(0) > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        return wav.squeeze(0)
+
+    if audio_mode == "stereo":
+        if wav.size(0) == 1:
+            wav = wav.repeat(2, 1)
+        elif wav.size(0) > 2:
+            wav = wav[:2]
+        return wav
+
+    raise ValueError(f"Unsupported audio_mode: {audio_mode}")
+
+
+def load_audio(path: str, target_sr: int, audio_mode: str = "mono") -> torch.Tensor:
+    """Load full audio with configurable mono/stereo output and resampling."""
     wav, sr = torchaudio.load(path)
-    if wav.size(0) > 1:
-        wav = wav.mean(dim=0, keepdim=True)
+    wav = format_audio_channels(wav, audio_mode=audio_mode)
+
     if sr != target_sr:
-        wav = torchaudio.functional.resample(wav, sr, target_sr)
-    return wav.squeeze(0)
+        if wav.dim() == 1:
+            wav = torchaudio.functional.resample(wav.unsqueeze(0), sr, target_sr).squeeze(0)
+        else:
+            wav = torchaudio.functional.resample(wav, sr, target_sr)
+    return wav
+
+
+def load_audio_mono(path: str, target_sr: int) -> torch.Tensor:
+    """Backward-compatible mono loader wrapper."""
+    return load_audio(path=path, target_sr=target_sr, audio_mode="mono")
 
 
 def spans_to_frame_targets(

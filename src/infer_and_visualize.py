@@ -16,7 +16,7 @@ import torch
 import torchaudio
 
 from model import ResNetConformerSED
-from utils import frame_probs_to_spans, load_audio_mono, plot_timeline, save_json
+from utils import frame_probs_to_spans, load_audio, plot_timeline, save_json
 
 
 @torch.no_grad()
@@ -32,14 +32,19 @@ def infer_full_audio(
     """Run sliding-window inference on a full audio waveform."""
     model.eval()
     w = waveform.to(device)
+    total_samples = w.shape[-1]
 
     window_samples = int(round(window_sec * sample_rate))
     stride_samples = max(1, int(round(window_samples * (1.0 - overlap))))
 
-    dummy = torch.zeros(1, window_samples, device=device)
+    in_channels = int(getattr(model, "audio_channels", 1))
+    if in_channels == 1:
+        dummy = torch.zeros(1, window_samples, device=device)
+    else:
+        dummy = torch.zeros(1, in_channels, window_samples, device=device)
     out_t = model(dummy).size(1)
 
-    total_sec = w.numel() / sample_rate
+    total_sec = total_samples / sample_rate
     total_frames = int(np.ceil(total_sec / frame_hop_sec))
     num_classes = model.classifier.out_features
 
@@ -47,16 +52,20 @@ def infer_full_audio(
     prob_cnt = np.zeros((total_frames, 1), dtype=np.float32)
 
     starts = list(
-        range(0, max(1, w.numel() - window_samples + 1), stride_samples)
+        range(0, max(1, total_samples - window_samples + 1), stride_samples)
     )
-    if not starts or starts[-1] + window_samples < w.numel():
-        starts.append(max(0, w.numel() - window_samples))
+    if not starts or starts[-1] + window_samples < total_samples:
+        starts.append(max(0, total_samples - window_samples))
 
     for s in starts:
-        clip = w[s:s + window_samples]
-        if clip.numel() < window_samples:
+        if w.dim() == 1:
+            clip = w[s:s + window_samples]
+        else:
+            clip = w[:, s:s + window_samples]
+
+        if clip.shape[-1] < window_samples:
             clip = torch.nn.functional.pad(
-                clip, (0, window_samples - clip.numel()))
+                clip, (0, window_samples - clip.shape[-1]))
         logits = model(clip.unsqueeze(0))
         probs = torch.sigmoid(logits)[0].detach().cpu().numpy()
 
@@ -110,8 +119,8 @@ def save_predicted_audio_clips(
 ) -> int:
     """Export predicted event spans as per-class audio clips."""
     saved = 0
-    total_samples = waveform.numel()
-    waveform_2d = waveform.unsqueeze(0)
+    total_samples = waveform.shape[-1]
+    waveform_2d = waveform if waveform.dim() == 2 else waveform.unsqueeze(0)
 
     for span in pred_spans:
         label = str(span["event_label"])
@@ -275,6 +284,8 @@ def main():
     ap.add_argument("--window_sec", type=float, default=None)
     ap.add_argument("--overlap", type=float, default=0.5)
     ap.add_argument("--save_pred_clips", action="store_true")
+    ap.add_argument("--audio_mode", type=str, default="auto",
+                    choices=["auto", "mono", "stereo"])
     args = ap.parse_args()
 
     if not args.audio and not args.audio_dir:
@@ -299,12 +310,16 @@ def main():
     window_sec = float(args.window_sec) if args.window_sec is not None else float(
         ckpt.get("window_sec", 10.0)
     )
+    ckpt_audio_mode = str(ckpt.get("audio_mode", "mono"))
+    audio_mode = ckpt_audio_mode if args.audio_mode == "auto" else args.audio_mode
+    audio_channels = 2 if audio_mode == "stereo" else 1
 
     model = ResNetConformerSED(
         num_classes=len(label_to_idx),
         sample_rate=sample_rate,
         feature_extractor='melspec',
-        use_specaug=False)
+        use_specaug=False,
+        audio_channels=audio_channels)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
 
@@ -313,7 +328,7 @@ def main():
 
     pred_id = int(args.labelstudio_prediction_id_start)
     for audio_path in audio_files:
-        waveform = load_audio_mono(audio_path, sample_rate)
+        waveform = load_audio(audio_path, sample_rate, audio_mode=audio_mode)
         probs = infer_full_audio(
             model=model,
             waveform=waveform,
@@ -337,8 +352,9 @@ def main():
 
         timeline_out = os.path.join(
             args.output_dir, f"{audio_stem}_timeline.png")
+        waveform_plot = waveform[0] if waveform.dim() == 2 else waveform
         plot_timeline(
-            waveform=waveform.cpu().numpy(),
+            waveform=waveform_plot.cpu().numpy(),
             sr=sample_rate,
             gt_spans=gt_spans,
             pred_spans=pred_spans,
@@ -368,7 +384,7 @@ def main():
             build_labelstudio_task(
                 audio_uri=audio_uri,
                 pred_spans=pred_spans,
-                original_length=float(waveform.numel() / sample_rate),
+                original_length=float(waveform.shape[-1] / sample_rate),
                 from_name=args.labelstudio_from_name,
                 to_name=args.labelstudio_to_name,
                 prediction_id=pred_id,

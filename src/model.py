@@ -140,12 +140,14 @@ class UNetConformerSED(nn.Module):
         freq_mask_param: int = 10,
         time_mask_param: int = 30,
         feature_extractor: str = "melspec",  # "melspec" or "wav2vec2"
+        audio_channels: int = 1,
     ):
         """Initialize UNetConformerSED model components."""
         super().__init__()
 
         self.feature_extractor = feature_extractor
         self.use_specaug = use_specaug
+        self.audio_channels = audio_channels
 
         # =========================
         # Mel Spectrogram
@@ -168,7 +170,7 @@ class UNetConformerSED(nn.Module):
         # =========================
         # U-Net（只用于 melspec）
         # =========================
-        self.enc1 = UNetBlock(1, 32)
+        self.enc1 = UNetBlock(audio_channels, 32)
         self.enc2 = UNetBlock(32, 64)
         self.enc3 = UNetBlock(64, 128)
 
@@ -211,12 +213,37 @@ class UNetConformerSED(nn.Module):
         # =========================
         self.classifier = nn.Linear(conformer_dim, num_classes)
 
+    def _ensure_audio_channels(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Normalize input waveform shape to [B, C, S] with configured channels."""
+        if waveform.dim() == 2:
+            waveform = waveform.unsqueeze(1)
+        elif waveform.dim() != 3:
+            raise ValueError(
+                f"Expected waveform dims 2/3, got shape={tuple(waveform.shape)}")
+
+        c = waveform.size(1)
+        if c == self.audio_channels:
+            return waveform
+
+        if self.audio_channels == 1:
+            return waveform.mean(dim=1, keepdim=True)
+
+        if self.audio_channels == 2 and c == 1:
+            return waveform.repeat(1, 2, 1)
+
+        if self.audio_channels == 2 and c > 2:
+            return waveform[:, :2, :]
+
+        raise ValueError(
+            f"Unsupported channel conversion: input={c}, expected={self.audio_channels}")
+
     # =========================
     # 特征提取
     # =========================
     def extract_features(self, waveform):
         """Extract frame-level features from waveform."""
         if self.feature_extractor == "melspec":
+            waveform = self._ensure_audio_channels(waveform)
             x = self.melspec(waveform) + 1e-10
             x = self.db(x)
 
@@ -227,7 +254,7 @@ class UNetConformerSED(nn.Module):
                 x.std(dim=(-2, -1), keepdim=True) + 1e-5
             )
 
-            return x  # (B, M, T)
+            return x  # (B, C, M, T)
 
         elif self.feature_extractor == "wav2vec2":
             with torch.no_grad():
@@ -244,9 +271,7 @@ class UNetConformerSED(nn.Module):
         """Forward pass producing frame-wise event logits."""
 
         if self.feature_extractor == "melspec":
-            x = self.extract_features(waveform)  # (B, M, T)
-
-            x = x.unsqueeze(1)  # (B,1,M,T)
+            x = self.extract_features(waveform)  # (B, C, M, T)
 
             # ===== Encoder =====
             e1 = self.enc1(x)               # (B,32,M,T)
@@ -303,7 +328,8 @@ class ResNetConformerSED(nn.Module):
         feature_extractor: str = "wav2vec2",
         device: torch.device = torch.device("cuda"),
         use_wenet=False,
-        use_wenet_ckpt=True
+        use_wenet_ckpt=True,
+        audio_channels: int = 1,
     ):
         """Initialize ResNetConformerSED model components."""
         super().__init__()
@@ -313,6 +339,7 @@ class ResNetConformerSED(nn.Module):
         self.use_specaug = use_specaug
         self.feature_extractor = feature_extractor
         self.use_wenet = use_wenet
+        self.audio_channels = audio_channels
         self.melspec = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -326,7 +353,8 @@ class ResNetConformerSED(nn.Module):
         self.db = torchaudio.transforms.AmplitudeToDB(top_db=80)
 
         self.cnn_stem = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=(1, 1), padding=1),
+            nn.Conv2d(audio_channels, 32, kernel_size=3,
+                      stride=(1, 1), padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
@@ -368,10 +396,35 @@ class ResNetConformerSED(nn.Module):
                 torchaudio.transforms.TimeMasking(time_mask_param)
             )
 
+    def _ensure_audio_channels(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Normalize input waveform shape to [B, C, S] with configured channels."""
+        if waveform.dim() == 2:
+            waveform = waveform.unsqueeze(1)
+        elif waveform.dim() != 3:
+            raise ValueError(
+                f"Expected waveform dims 2/3, got shape={tuple(waveform.shape)}")
+
+        c = waveform.size(1)
+        if c == self.audio_channels:
+            return waveform
+
+        if self.audio_channels == 1:
+            return waveform.mean(dim=1, keepdim=True)
+
+        if self.audio_channels == 2 and c == 1:
+            return waveform.repeat(1, 2, 1)
+
+        if self.audio_channels == 2 and c > 2:
+            return waveform[:, :2, :]
+
+        raise ValueError(
+            f"Unsupported channel conversion: input={c}, expected={self.audio_channels}")
+
     def extract_features(self, waveform: torch.Tensor) -> torch.Tensor:
         """Extract spectral features from raw waveform."""
         if self.feature_extractor == "melspec":
-            x = self.melspec(waveform) + 1e-10  # [B, M, T]
+            waveform = self._ensure_audio_channels(waveform)
+            x = self.melspec(waveform) + 1e-10  # [B, C, M, T]
             x = self.db(x)
             if self.use_specaug and self.training:
                 x = self.specaug(x)
@@ -380,6 +433,8 @@ class ResNetConformerSED(nn.Module):
             return x
 
         elif self.feature_extractor == "fbank":
+            if waveform.dim() == 3:
+                waveform = waveform.mean(dim=1)
             bs = waveform.size(0)
             features = []
             for i in range(bs):
@@ -397,10 +452,8 @@ class ResNetConformerSED(nn.Module):
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """Forward pass producing frame-wise event logits."""
-        x = self.extract_features(waveform)  # [B, M, T]
+        x = self.extract_features(waveform)
         if self.feature_extractor == "melspec":
-
-            x = x.unsqueeze(1)  # [B, 1, M, T]
             x = self.cnn_stem(x)
             x = self.cnn(x)  # [B, C, M', T]
             x = x.mean(dim=2)  # [B, C, T]
