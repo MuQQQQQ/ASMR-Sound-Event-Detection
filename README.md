@@ -16,7 +16,7 @@
 
 This repository provides an end-to-end pipeline for **training** and **inference** of a **frame-level Sound Event Detection (SED)** model tailored for ASMR audio.
 
-### Supported Event Labels
+## 1. Supported Event Labels
 
 * Speech
 * Chewing
@@ -26,7 +26,7 @@ This repository provides an end-to-end pipeline for **training** and **inference
 
 ---
 
-## Project Structure
+## 2. Project Structure
 
 Core implementation is located in `src/`:
 
@@ -37,20 +37,18 @@ Core implementation is located in `src/`:
 * `utils.py` — shared utilities
 * `convert_labels.py` — convert Label Studio JSON annotations to CSV
 
----
 
-## Model Architecture
+## 3. Model Architecture
 
 The model follows a lightweight **ResNet + Conformer** design for frame-wise prediction.
 
-### Input
+### 3.1 Input
 
 * `waveform`: **[B, S]**
   *(batch size, number of audio samples)*
 
----
 
-### Feature Extraction
+### 3.2Feature Extraction
 
 Using `torchaudio.transforms.MelSpectrogram`:
 
@@ -58,21 +56,20 @@ Using `torchaudio.transforms.MelSpectrogram`:
 * Output: **[B, M, T]**
   *(batch size, mel bins, time frames)*
 
----
 
-### ResNet Backbone
+### 3.3 ResNet Backbone
 
 Input: `x ∈ [B, M, T]`
 
-1. Expand channel dimension
+(1). Expand channel dimension
    → `[B, 1, M, T]`
 
-2. Stem:
+(2). Stem:
 
    * Conv2d(1 → 32, kernel=3, stride=1, padding=1)
    * BatchNorm + ReLU
 
-3. Residual blocks:
+(3). Residual blocks:
 
    * `ResBlock2D(32, 64, stride=(2,1))`
    * `ResBlock2D(64, 128, stride=(2,1))`
@@ -80,44 +77,41 @@ Input: `x ∈ [B, M, T]`
 
 Output: **[B, 128, M/4, T]**
 
-#### Frequency Pooling
+#### 3.3.1 Frequency Pooling
 
 * Mean over frequency → `[B, 128, T]`
 * Transpose → `[B, T, 128]`
 
 This converts 2D time-frequency features into a temporal sequence.
 
----
 
-### Projection Layer
+### 3.4 Projection Layer
 
 * `Linear(128 → conformer_dim) + Dropout`
 * `conformer_dim = 256`
 
 Output: **[B, T, 256]**
 
----
 
-### Conformer Encoder
+### 3.5 Conformer Encoder
 
 Stack of **4 Conformer blocks**, each including:
 
-1. Feed-forward module (half residual)
-2. Multi-head self-attention
-3. Convolution module:
+(1). Feed-forward module (half residual)
+(2). Multi-head self-attention
+(3). Convolution module:
 
    * LayerNorm → pointwise Conv1d → GLU
    * Depthwise Conv1d
    * BatchNorm + SiLU
    * Pointwise Conv1d + Dropout
-4. Second feed-forward module
-5. Final LayerNorm
+(4). Second feed-forward module
+(5). Final LayerNorm
 
 Output shape remains: **[B, T, 256]**
 
----
 
-### Frame-wise Classifier
+### 3.6 Frame-wise Classifier
 
 * `Linear(256 → num_classes)`
 
@@ -127,7 +121,7 @@ Output:
 
 ---
 
-## 1. Environment Setup
+## 4. Environment Setup
 
 Install dependencies:
 
@@ -139,11 +133,11 @@ Most modern Python versions should work.
 
 ---
 
-## 2. Data Format
+## 5. Data Format
 
 Audio files should be placed in `data/`.
 
-### Annotation CSV format
+Annotation CSV format:
 
 Required columns:
 
@@ -162,7 +156,7 @@ out000.mp3,4.00,4.60,Speech
 
 ---
 
-## 3. Training
+## 6. Training
 
 Basic command:
 
@@ -175,7 +169,7 @@ python src/train.py \
   --lr 1e-4
 ```
 
-### Multiple annotation files
+### 6.1 Multiple annotation files
 
 ```bash
 --annotations data/a.csv,data/b.csv,data/c.csv
@@ -183,9 +177,8 @@ python src/train.py \
 
 > All referenced audio files must reside in the same `data_dir`.
 
----
 
-### Useful options
+### 6.2 Useful options
 
 * `--use_ema` — enable EMA
 * `--loss_type {bce,focal}`
@@ -195,9 +188,7 @@ python src/train.py \
 * `--use_lazy_loading` — use lazy loading 
 * `--files_per_batch N` — each batch samples windows only from `N` random audio files
 
----
-
-### Training Outputs
+### 6.3 Training Outputs
 
 Saved under `logs/<timestamp>/`:
 
@@ -208,9 +199,9 @@ Saved under `logs/<timestamp>/`:
 
 ---
 
-## 4. Inference & Visualization
+## 7. Inference & Visualization
 
-### Single file
+### 7.1 Single file
 
 ```bash
 python src/infer_and_visualize.py \
@@ -219,7 +210,7 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
-### Batch inference
+### 7.2 Batch inference
 
 ```bash
 python src/infer_and_visualize.py \
@@ -228,9 +219,8 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
----
 
-### Optional arguments
+### 7.3 Optional arguments
 
 * `--save_pred_clips` — export predicted clips by class
 * `--pred_json` — custom prediction JSON filename
@@ -239,9 +229,7 @@ python src/infer_and_visualize.py \
   * `auto`: follow checkpoint training setting
   * `mono`/`stereo`: manually override
 
----
-
-### Outputs
+### 7.4 Outputs
 
 Saved in `outputs/`:
 
@@ -252,7 +240,7 @@ Saved in `outputs/`:
 
 ---
 
-## 5. Convert Label Studio JSON to CSV
+## 8. Convert Label Studio JSON to CSV
 
 ```bash
 python src/convert_labels.py \
@@ -279,9 +267,8 @@ Generated CSV contains:
 
 本项目提供了一套完整的流程，用于对 **ASMR 音频进行帧级声音事件检测（Sound Event Detection, SED）模型的训练与推理**。
 
----
 
-### 支持的事件类别
+## 1. 支持的事件类别
 
 * 语音（Speech）
 * 咀嚼声（Chewing）
@@ -291,7 +278,7 @@ Generated CSV contains:
 
 ---
 
-## 项目结构
+## 2. 项目结构
 
 核心代码位于 `src/` 目录：
 
@@ -304,72 +291,65 @@ Generated CSV contains:
 
 ---
 
-## 模型结构
+## 3. 模型结构
 
 模型采用轻量级 **ResNet + Conformer** 架构，实现帧级预测。
 
----
-
-### 输入
+### 3.1 输入
 
 * `waveform`：形状 **[B, S]**
   （批大小，音频采样点数）
 
----
 
-### 特征提取
+### 3.2 特征提取
 
 使用 `MelSpectrogram`：
 
 * 关键参数：`n_fft`、`win_length`、`hop_length`、`n_mels`、`sample_rate`
 * 输出：**[B, M, T]**（批大小 × 梅尔频带 × 时间帧）
 
----
 
-### ResNet 主干
+### 3.3 ResNet 主干
 
 输入：`[B, M, T]`
 
 处理流程：
 
-1. 扩展通道 → `[B, 1, M, T]`
-2. 卷积 Stem（Conv + BN + ReLU）
-3. 三个残差块（逐步压缩频率维）
+(1). 扩展通道 → `[B, 1, M, T]`
+(2). 卷积 Stem（Conv + BN + ReLU）
+(3). 三个残差块（逐步压缩频率维）
 
 输出： **[B, 128, M/4, T]**
 
-#### 频率维池化
+#### 3.3.1 频率维池化
 
 * 对频率维取均值 → `[B, 128, T]`
 * 转置 → `[B, T, 128]`
 
 将时频特征转换为时间序列特征
 
----
 
-### 投影层
+### 3.4 投影层
 
 * `Linear(128 → 256) + Dropout`
 
 输出： **[B, T, 256]**
 
----
 
-### Conformer 编码器
+### 3.5 Conformer 编码器
 
 包含 4 个 Conformer Block，每个 Block 包括：
 
-1. 前馈网络（半残差）
-2. 多头自注意力
-3. 卷积模块（GLU + 深度可分离卷积等）
-4. 第二个前馈网络
-5. LayerNorm
+(1). 前馈网络（半残差）
+(2). 多头自注意力
+(3). 卷积模块（GLU + 深度可分离卷积等）
+(4). 第二个前馈网络
+(5). LayerNorm
 
 输出维度保持不变：**[B, T, 256]**
 
----
 
-### 帧级分类器
+### 3.6 帧级分类器
 
 * `Linear(256 → 类别数)`
 
@@ -377,7 +357,7 @@ Generated CSV contains:
 
 ---
 
-## 1. 环境安装
+## 4. 环境安装
 
 ```bash
 pip install -r requirements.txt
@@ -387,11 +367,11 @@ pip install -r requirements.txt
 
 ---
 
-## 2. 数据格式
+## 5. 数据格式
 
 音频文件放置于 `data/` 目录。
 
-### 标注 CSV 格式
+标注 CSV 格式:
 
 必须包含以下字段：
 
@@ -410,7 +390,7 @@ out000.mp3,4.00,4.60,Speech
 
 ---
 
-## 3. 模型训练
+## 6. 模型训练
 
 ```bash
 python src/train.py \
@@ -421,7 +401,7 @@ python src/train.py \
   --lr 1e-4
 ```
 
-### 多标注文件
+### 6.1 多标注文件
 
 ```bash
 --annotations data/a.csv,data/b.csv,data/c.csv
@@ -429,21 +409,18 @@ python src/train.py \
 
 > 所有音频必须位于同一个 `data_dir` 下
 
----
 
-### 常用参数
+### 6.2 常用参数
 
 * `--use_ema`：启用 EMA
 * `--loss_type {bce,focal}`
 * `--lr_scheduler {cosine,step,custom,none}`
 * `--amp`：混合精度
 * `--audio_mode {mono,stereo}`：音频通道模式（stereo 会按双通道读取）
-* `--disable_lazy_loading`：懒加载
+* `--use_lazy_loading`：懒加载
 * `--files_per_batch N`：每个 batch 仅从 `N` 个随机音频文件中采样窗口
 
----
-
-### 输出结果
+### 6.3 输出结果
 
 保存在 `logs/<时间戳>/`：
 
@@ -454,9 +431,9 @@ python src/train.py \
 
 ---
 
-## 4. 推理与可视化
+## 7. 推理与可视化
 
-### 单文件
+### 7.1 单文件
 
 ```bash
 python src/infer_and_visualize.py \
@@ -465,7 +442,7 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
-### 批量推理
+### 7.2 批量推理
 
 ```bash
 python src/infer_and_visualize.py \
@@ -474,9 +451,7 @@ python src/infer_and_visualize.py \
   --output_dir outputs
 ```
 
----
-
-### 可选参数
+### 7.3 可选参数
 
 * `--save_pred_clips`：导出预测片段
 * `--pred_json`：自定义预测 JSON 名称
@@ -485,9 +460,7 @@ python src/infer_and_visualize.py \
   * `auto`：跟随 checkpoint 中训练配置
   * `mono`/`stereo`：手动覆盖
 
----
-
-### 输出内容
+### 7.4 输出内容
 
 位于 `outputs/`：
 
@@ -498,7 +471,7 @@ python src/infer_and_visualize.py \
 
 ---
 
-## 5. Label Studio 转 CSV
+## 8. Label Studio 转 CSV
 
 ```bash
 python src/convert_labels.py \
