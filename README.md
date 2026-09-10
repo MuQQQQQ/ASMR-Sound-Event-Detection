@@ -27,8 +27,9 @@
 
 模型以音频波形为输入，通过Mel Spectrogram + ResNet + Conformer提取时频特征，并对音频进行逐帧（frame-level）声音事件预测。项目主要面向 ASMR 音频中的人声、食音、口腔音、呼吸声以及不同类型的摩擦/刮擦等声音事件。
 
-> 如果你只想处理自己的ASMR音频并生成最终的时间轴可视化视频，无需进行模型训练，可以直接使用 `all_in_one.py`。
+> 如果你只想处理自己的ASMR音频并生成最终的时间轴可视化视频，无需进行模型训练，可以直接使用 `all_in_one.py`。发布视频时请注明本仓库~
 
+> 数据集：https://www.kaggle.com/datasets/qiqinli/asmr-sed/data
 ---
 
 ## 1. 支持的声音事件
@@ -560,8 +561,9 @@ The model takes raw audio waveforms as input and uses a **Mel Spectrogram + ResN
 
 The project is primarily designed for ASMR audio containing speech, chewing, mouth sounds, breathing, water bottle sounds, and different types of rubbing, scraping, and other non-target sound effects.
 
-> If you **only want to process your own ASMR audio and generate the final timeline visualization video**, you do not need to train the SED model. You can directly use `all_in_one.py`.
+> If you **only want to process your own ASMR audio and generate the final timeline visualization video**, you do not need to train the SED model. You can directly use `all_in_one.py`. If you use this repository to generate videos, please cite this repository in your work~
 
+> Dataset: https://www.kaggle.com/datasets/qiqinli/asmr-sed/data
 ---
 
 ## 1. Supported Sound Events
