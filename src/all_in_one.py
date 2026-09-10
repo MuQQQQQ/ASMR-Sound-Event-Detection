@@ -301,7 +301,7 @@ def parse_args():
     ap.add_argument("--audio", type=str, default=None,
                     help="Single audio file")
     ap.add_argument("--audio_dir", type=str,
-                    default=r'D:\ASMR\1\gzy_processed', help="Directory of audio files")
+                    default=None, help="Directory of audio files")
     ap.add_argument("--background", type=str, default="1.png")
     ap.add_argument("--author", type=str, default="顾子韵_w")
     ap.add_argument("--ffmpeg", type=str, default=DEFAULT_FFMPEG)
@@ -311,7 +311,7 @@ def parse_args():
     ap.add_argument("--temp_dir", type=str, default=None,
                     help="Temp folder for split clips")
     ap.add_argument("--checkpoint", type=str,
-                    default=r"mono_logs\run_017\last_checkpoint.pth")
+                    default=r"last_checkpoint.pth")
     ap.add_argument("--video_dir", type=str, default=None,
                     help="Directory for rendered videos")
 

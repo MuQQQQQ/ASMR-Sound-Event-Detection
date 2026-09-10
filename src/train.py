@@ -501,7 +501,7 @@ def main():
     ap.add_argument("--batch_size", type=int, default=30)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--val_ratio", type=float, default=0.01)
+    ap.add_argument("--val_ratio", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--checkpoint", type=str, default="")
     ap.add_argument("--use_specaug", action="store_true", default=False)
