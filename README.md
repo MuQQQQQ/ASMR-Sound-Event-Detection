@@ -4,7 +4,7 @@
 
 <div align="center">
 
-[!](imgs/example.png)
+![](imgs/example.png)
 
 [![Language](https://img.shields.io/badge/Language-Python-blue)](#)
 
