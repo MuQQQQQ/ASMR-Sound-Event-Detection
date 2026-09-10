@@ -7,16 +7,139 @@ import random
 import re
 import shutil
 import string
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from typing import Dict, List
 from urllib.parse import quote, unquote
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torchaudio
+from tqdm import tqdm
 
 from model import ResNetConformerSED
 from utils import frame_probs_to_spans, load_audio, plot_timeline, save_json
+
+print("Infer CUDA available:", torch.cuda.is_available())
+print()
+CLASSES = {
+    "Speech",
+    "Chewing",
+    "Mouth_Sounds",
+    "Breathing",
+    "Tapping",
+    "Water_Bottle",
+    "Slime",
+    "Rub",
+    "Scrub",
+    "Rasp"
+}
+color_map = {
+    "Speech": "#1f77b4",
+    "Chewing": "#ff7f0e",
+    "Mouth_Sounds": "#2ca02c",
+    "Breathing": "#d62728",
+    "Tapping": "#e377c2",
+    "Water_Bottle": "#7f7f7f",
+    "Slime": "#bcbd22",
+    "Rub": "#17becf",
+    "Scrub": "#9467bd",
+    "Rasp": "#8c564b",
+}
+
+
+def load_worker(audio_path, sample_rate, audio_mode):
+    waveform = load_audio(
+        audio_path,
+        sample_rate,
+        audio_mode=audio_mode
+    )
+    return audio_path, waveform
+
+
+def postprocess_worker(
+    audio_path,
+    waveform,
+    probs,
+    sample_rate,
+    frame_hop_sec,
+    idx_to_label,
+    args,
+    model_name,
+    pred_id,
+):
+    audio_filename = os.path.basename(audio_path)
+    audio_stem = os.path.splitext(audio_filename)[0]
+
+    pred_spans = frame_probs_to_spans(
+        probs=probs,
+        idx_to_label=idx_to_label,
+        frame_hop_sec=frame_hop_sec,
+        threshold=args.threshold,
+        min_duration_sec=args.min_duration,
+    )
+
+    gt_spans = load_gt_spans(args.annotations, audio_filename)
+
+    timeline_out = os.path.join(
+        args.output_dir,
+        f"{audio_stem}_{model_name}.png"
+    )
+
+    waveform_plot = waveform[0] if waveform.dim() == 2 else waveform
+
+    if args.plot_timeline:
+        plot_timeline(
+            waveform=waveform_plot.cpu().numpy(),
+            sr=sample_rate,
+            gt_spans=gt_spans,
+            pred_spans=pred_spans,
+            output_path=timeline_out,
+            title=f"SED Timeline: {audio_filename}",
+            plot_waveform=False
+        )
+
+    if args.save_pred_clips:
+        clip_dir = os.path.join(
+            args.output_dir,
+            "pred_clips",
+            audio_stem
+        )
+
+        save_predicted_audio_clips(
+            waveform=waveform,
+            sample_rate=sample_rate,
+            pred_spans=pred_spans,
+            clip_root=clip_dir,
+        )
+
+    simple_pred = {
+        "audio": audio_filename,
+        "audio_path": audio_path,
+        "pred_spans": pred_spans,
+    }
+
+    audio_uri = to_labelstudio_audio_uri(audio_path)
+
+    labelstudio_task = build_labelstudio_task(
+        audio_uri=audio_uri,
+        pred_spans=pred_spans,
+        original_length=float(waveform.shape[-1] / sample_rate),
+        from_name=args.labelstudio_from_name,
+        to_name=args.labelstudio_to_name,
+        prediction_id=pred_id,
+        completed_by=args.labelstudio_completed_by,
+        origin=args.labelstudio_origin,
+        model_name=model_name
+    )
+
+    print(f"Processed: {audio_path} -> {timeline_out}")
+
+    return pred_id, simple_pred, labelstudio_task
 
 
 @torch.no_grad()
@@ -28,59 +151,129 @@ def infer_full_audio(
     window_sec: float = 10.0,
     overlap: float = 0.5,
     device: str = "cpu",
+    batch_size: int = 150,
 ) -> np.ndarray:
-    """Run sliding-window inference on a full audio waveform."""
+    """Run batched sliding-window inference on a full audio waveform."""
+
     model.eval()
-    w = waveform.to(device)
+
+    w = waveform.to(device, non_blocking=True)
     total_samples = w.shape[-1]
 
     window_samples = int(round(window_sec * sample_rate))
-    stride_samples = max(1, int(round(window_samples * (1.0 - overlap))))
+    stride_samples = max(
+        1,
+        int(round(window_samples * (1.0 - overlap))),
+    )
 
     in_channels = int(getattr(model, "audio_channels", 1))
-    if in_channels == 1:
-        dummy = torch.zeros(1, window_samples, device=device)
-    else:
-        dummy = torch.zeros(1, in_channels, window_samples, device=device)
-    out_t = model(dummy).size(1)
 
-    total_sec = total_samples / sample_rate
-    total_frames = int(np.ceil(total_sec / frame_hop_sec))
+    if in_channels == 1:
+        dummy = torch.zeros(
+            1,
+            window_samples,
+            device=device,
+        )
+    else:
+        dummy = torch.zeros(
+            1,
+            in_channels,
+            window_samples,
+            device=device,
+        )
+
+    out_t = model(dummy).size(1)
     num_classes = model.classifier.out_features
 
-    prob_sum = np.zeros((total_frames, num_classes), dtype=np.float32)
-    prob_cnt = np.zeros((total_frames, 1), dtype=np.float32)
+    del dummy
 
-    starts = list(
-        range(0, max(1, total_samples - window_samples + 1), stride_samples)
+    total_sec = total_samples / sample_rate
+    total_frames = int(
+        np.ceil(total_sec / frame_hop_sec)
     )
-    if not starts or starts[-1] + window_samples < total_samples:
-        starts.append(max(0, total_samples - window_samples))
 
-    for s in starts:
-        if w.dim() == 1:
-            clip = w[s:s + window_samples]
-        else:
-            clip = w[:, s:s + window_samples]
+    prob_sum = np.zeros(
+        (total_frames, num_classes),
+        dtype=np.float32,
+    )
+    prob_cnt = np.zeros(
+        (total_frames, 1),
+        dtype=np.float32,
+    )
 
-        if clip.shape[-1] < window_samples:
-            clip = torch.nn.functional.pad(
-                clip, (0, window_samples - clip.shape[-1]))
-        logits = model(clip.unsqueeze(0))
-        probs = torch.sigmoid(logits)[0].detach().cpu().numpy()
+    if total_samples <= window_samples:
+        starts = [0]
+    else:
+        starts = list(
+            range(
+                0,
+                total_samples - window_samples + 1,
+                stride_samples,
+            )
+        )
 
-        start_sec = s / sample_rate
-        g0 = int(round(start_sec / frame_hop_sec))
-        t = min(out_t, probs.shape[0])
-        g1 = min(total_frames, g0 + t)
-        if g1 <= g0:
-            continue
-        used = g1 - g0
+        last_start = total_samples - window_samples
 
-        prob_sum[g0:g1] += probs[:used]
-        prob_cnt[g0:g1] += 1.0
+        if starts[-1] != last_start:
+            starts.append(last_start)
 
-    prob_cnt = np.maximum(prob_cnt, 1.0)
+    for batch_start in tqdm(
+        range(0, len(starts), batch_size),
+        desc="infer",
+    ):
+        batch_starts = starts[
+            batch_start:batch_start + batch_size
+        ]
+
+        clips = []
+
+        for s in batch_starts:
+            clip = w[..., s:s + window_samples]
+
+            if clip.shape[-1] < window_samples:
+                clip = F.pad(
+                    clip,
+                    (0, window_samples - clip.shape[-1]),
+                )
+
+            clips.append(clip)
+
+        batch = torch.stack(clips, dim=0)
+
+        logits = model(batch)
+        probs = torch.sigmoid(logits)
+
+        probs = probs.float().cpu().numpy()
+
+        for i, s in enumerate(batch_starts):
+            start_sec = s / sample_rate
+            g0 = int(round(start_sec / frame_hop_sec))
+
+            t = min(
+                out_t,
+                probs.shape[1],
+            )
+
+            g1 = min(
+                total_frames,
+                g0 + t,
+            )
+
+            if g1 <= g0:
+                continue
+
+            used = g1 - g0
+
+            prob_sum[g0:g1] += probs[i, :used]
+            prob_cnt[g0:g1] += 1.0
+
+        del batch, logits, probs
+
+    prob_cnt = np.maximum(
+        prob_cnt,
+        1.0,
+    )
+
     return prob_sum / prob_cnt
 
 
@@ -166,16 +359,14 @@ def normalize_slashes(path: str) -> str:
 
 def to_labelstudio_audio_uri(original_path: str) -> str:
     """Convert local audio path into a Label Studio-compatible URI."""
-    # normalize mixed slashes first
+
     p = normalize_slashes(original_path)
 
-    # replace D:/ prefix with /data/local-files/?d=
-    if re.match(r"^[dD]:/", p):
-        rel = p[3:]
+    if re.match(r"^[a-zA-Z]:/SED/", p):
+        rel = re.sub(r"^[a-zA-Z]:/SED/", "", p)
         encoded = quote(rel, safe="/")
         return f"/data/local-files/?d={encoded}"
 
-    # fallback: keep path but URL-encode unicode and unsafe chars
     return quote(p, safe="/:")
 
 
@@ -188,10 +379,14 @@ def build_labelstudio_task(
     prediction_id: int,
     completed_by: int,
     origin: str,
+    model_name: str
 ) -> Dict:
     """Build one Label Studio task object from predicted spans."""
     disabled_labels = set(['Scraping', 'Tapping'])
+    disabled_labels = set()
     result_items = []
+    sort_by_order = ['Rub', 'Scrub', 'Rasp', 'Water_Bottle', 'Tapping', 'Slime',
+                     'Breathing', 'Chewing', 'Speech', 'Mouth_Sounds', 'Drinking']
     for s in pred_spans:
         st = float(s["start_time"])
         ed = float(s["end_time"])
@@ -222,6 +417,9 @@ def build_labelstudio_task(
                 "score": score,
             }
         )
+    # sort
+    result_items.sort(key=lambda x: (sort_by_order.index(
+        x['value']['labels'][0]) if x['value']['labels'][0] in sort_by_order else len(sort_by_order), x['value']['start']))
     filename = unquote(os.path.basename(audio_uri))
     return {
         "predictions": [
@@ -231,7 +429,7 @@ def build_labelstudio_task(
                 "result": result_items,
             }
         ],
-        "data": {"audio": audio_uri, "filename": filename},
+        "data": {"audio": audio_uri, "filename": filename, "completed_by": model_name},
     }
 
 
@@ -267,7 +465,7 @@ def main():
                     help="Directory for batch inference")
     ap.add_argument("--annotations", type=str, default="data/anno3.csv")
     ap.add_argument("--checkpoint", type=str,
-                    default=r"logs\20260405-001204\best_checkpoint.pth")
+                    default=r"mono_logs\run_001\best_checkpoint.pth")
     ap.add_argument("--output_dir", type=str, default="outputs")
     ap.add_argument("--pred_json", type=str, default="pred_spans.json")
     ap.add_argument("--pred_labelstudio_json", type=str,
@@ -284,21 +482,33 @@ def main():
     ap.add_argument("--window_sec", type=float, default=None)
     ap.add_argument("--overlap", type=float, default=0.5)
     ap.add_argument("--save_pred_clips", action="store_true")
+    ap.add_argument("--clear", action="store_true")
     ap.add_argument("--audio_mode", type=str, default="auto",
                     choices=["auto", "mono", "stereo"])
+    # --sample_rate 48000 --n_fft 3072 --hop_length 960 --win_length 3072 --n_mels 128
+    ap.add_argument("--sample_rate", type=int, default=16000)
+    ap.add_argument("--n_fft", type=int, default=1024)
+    ap.add_argument("--hop_length", type=int, default=320)
+    ap.add_argument("--win_length", type=int, default=1024)
+    ap.add_argument("--n_mels", type=int, default=64)
+    ap.add_argument("--plot_timeline", action="store_true")
+    ap.add_argument("--multiprocessing", action="store_true")
     args = ap.parse_args()
 
     if not args.audio and not args.audio_dir:
         raise ValueError("Provide either --audio or --audio_dir (or both).")
 
-    clear_directory_contents(args.output_dir)
+    if args.clear:
+        clear_directory_contents(args.output_dir)
 
-    audio_files = collect_audio_files(args.audio, args.audio_dir)
+    audio_files = collect_audio_files(
+        args.audio, args.audio_dir)  # list of file paths
+    random.shuffle(audio_files)
     if not audio_files:
         raise ValueError("No valid audio files found.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     label_to_idx = ckpt["label_to_idx"]
     idx_to_label = (
         {int(k): v for k, v in ckpt["idx_to_label"].items()}
@@ -311,6 +521,7 @@ def main():
         ckpt.get("window_sec", 10.0)
     )
     ckpt_audio_mode = str(ckpt.get("audio_mode", "mono"))
+    print(f"Loaded checkpoint: {args.checkpoint}, mode = {ckpt_audio_mode}")
     audio_mode = ckpt_audio_mode if args.audio_mode == "auto" else args.audio_mode
     audio_channels = 2 if audio_mode == "stereo" else 1
 
@@ -319,93 +530,339 @@ def main():
         sample_rate=sample_rate,
         feature_extractor='melspec',
         use_specaug=False,
-        audio_channels=audio_channels)
+        audio_channels=audio_channels,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        win_length=args.win_length,
+        n_mels=args.n_mels,
+        conformer_dim=256
+    )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
 
     simple_preds = []
     labelstudio_tasks = []
 
+    model_name = args.checkpoint.split(os.sep)[-2].split(".")[0]
+
     pred_id = int(args.labelstudio_prediction_id_start)
-    for audio_path in audio_files:
-        waveform = load_audio(audio_path, sample_rate, audio_mode=audio_mode)
-        probs = infer_full_audio(
-            model=model,
-            waveform=waveform,
-            sample_rate=sample_rate,
-            frame_hop_sec=frame_hop_sec,
-            window_sec=window_sec,
-            overlap=args.overlap,
-            device=device,
-        )
-        pred_spans = frame_probs_to_spans(
-            probs=probs,
-            idx_to_label=idx_to_label,
-            frame_hop_sec=frame_hop_sec,
-            threshold=args.threshold,
-            min_duration_sec=args.min_duration,
-        )
-
-        audio_filename = os.path.basename(audio_path)
-        audio_stem = os.path.splitext(audio_filename)[0]
-        gt_spans = load_gt_spans(args.annotations, audio_filename)
-
-        timeline_out = os.path.join(
-            args.output_dir, f"{audio_stem}_timeline.png")
-        waveform_plot = waveform[0] if waveform.dim() == 2 else waveform
-        plot_timeline(
-            waveform=waveform_plot.cpu().numpy(),
-            sr=sample_rate,
-            gt_spans=gt_spans,
-            pred_spans=pred_spans,
-            output_path=timeline_out,
-            title=f"SED Timeline: {audio_filename}",
-        )
-
-        if args.save_pred_clips:
-            clip_dir = os.path.join(args.output_dir, "pred_clips", audio_stem)
-            save_predicted_audio_clips(
-                waveform=waveform,
-                sample_rate=sample_rate,
-                pred_spans=pred_spans,
-                clip_root=clip_dir,
-            )
-
-        simple_preds.append(
-            {
-                "audio": audio_filename,
-                "audio_path": audio_path,
-                "pred_spans": pred_spans,
-            }
-        )
-
-        audio_uri = to_labelstudio_audio_uri(audio_path)
-        labelstudio_tasks.append(
-            build_labelstudio_task(
-                audio_uri=audio_uri,
-                pred_spans=pred_spans,
-                original_length=float(waveform.shape[-1] / sample_rate),
-                from_name=args.labelstudio_from_name,
-                to_name=args.labelstudio_to_name,
-                prediction_id=pred_id,
-                completed_by=args.labelstudio_completed_by,
-                origin=args.labelstudio_origin,
-            )
-        )
-        pred_id += 1
-        print(f"Processed: {audio_path} -> {timeline_out}")
-
-    save_json(os.path.join(args.output_dir, args.pred_json),
-              {"items": simple_preds})
     pred_labelstudio_json = os.path.join(
-        args.output_dir, args.pred_labelstudio_json)
+        args.output_dir, f'0_{model_name}.json')
     os.makedirs(os.path.dirname(pred_labelstudio_json)
                 or ".", exist_ok=True)
-    with open(pred_labelstudio_json, "w", encoding="utf-8") as f:
-        json.dump(labelstudio_tasks, f, ensure_ascii=False, indent=2)
 
-    print(f"Saved aggregated simple predictions: {args.pred_json}")
-    print(f"Saved aggregated Label Studio JSON: {pred_labelstudio_json}")
+    num_workers = 4
+    load_workers = 4
+    post_workers = 1
+
+    audio_queue_size = load_workers * 2
+    result_queue_size = post_workers * 2
+
+    audio_queue = Queue(maxsize=audio_queue_size)
+    result_queue = Queue(maxsize=result_queue_size)
+
+    STOP = object()
+
+    simple_preds = []
+    labelstudio_tasks = []
+
+    pred_id_start = int(args.labelstudio_prediction_id_start)
+
+    simple_preds_lock = threading.Lock()
+    save_lock = threading.Lock()
+
+    # ============================================================
+    # Stage 1: Audio loading
+    # ============================================================
+
+    def audio_producer():
+        try:
+            with ThreadPoolExecutor(max_workers=load_workers) as executor:
+                futures = []
+
+                for audio_path in audio_files:
+                    future = executor.submit(
+                        load_worker,
+                        audio_path,
+                        sample_rate,
+                        audio_mode
+                    )
+                    futures.append(future)
+
+                for future in futures:
+                    audio_path, waveform = future.result()
+                    audio_queue.put((audio_path, waveform))
+
+        except Exception as e:
+            print(f"[Audio Producer Error] {e}")
+            raise
+
+        finally:
+            audio_queue.put(STOP)
+
+    # ============================================================
+    # Stage 2: GPU inference
+    # ============================================================
+
+    def inference_worker():
+        model.eval()
+
+        with torch.inference_mode():
+
+            while True:
+                item = audio_queue.get()
+
+                if item is STOP:
+                    audio_queue.task_done()
+                    break
+
+                audio_path, waveform = item
+
+                try:
+                    probs = infer_full_audio(
+                        model=model,
+                        waveform=waveform,
+                        sample_rate=sample_rate,
+                        frame_hop_sec=frame_hop_sec,
+                        window_sec=window_sec,
+                        overlap=args.overlap,
+                        device=device,
+                    )
+
+                    result_queue.put(
+                        (audio_path, waveform, probs)
+                    )
+
+                except Exception as e:
+                    print(f"[Inference Error] {audio_path}: {e}")
+
+                finally:
+                    audio_queue.task_done()
+
+        for _ in range(post_workers):
+            result_queue.put(STOP)
+
+    # ============================================================
+    # Stage 3: Post-processing / plotting / saving
+    # ============================================================
+
+    def postprocess_consumer():
+
+        while True:
+            item = result_queue.get()
+
+            if item is STOP:
+                result_queue.task_done()
+                break
+
+            audio_path, waveform, probs = item
+
+            try:
+                # pred_id 必须唯一
+                with pred_id_lock:
+                    pred_id = next_pred_id[0]
+                    next_pred_id[0] += 1
+
+                result = postprocess_worker(
+                    audio_path=audio_path,
+                    waveform=waveform,
+                    probs=probs,
+                    sample_rate=sample_rate,
+                    frame_hop_sec=frame_hop_sec,
+                    idx_to_label=idx_to_label,
+                    args=args,
+                    model_name=model_name,
+                    pred_id=pred_id,
+                )
+
+                _, simple_pred, labelstudio_task = result
+
+                with simple_preds_lock:
+                    simple_preds.append(simple_pred)
+                    labelstudio_tasks.append(labelstudio_task)
+
+            except Exception as e:
+                print(f"[Postprocess Error] {audio_path}: {e}")
+
+            finally:
+                result_queue.task_done()
+
+    # ============================================================
+    # Start pipeline
+    # ============================================================
+
+    if args.multiprocessing:
+        pred_id_lock = threading.Lock()
+        next_pred_id = [pred_id_start]
+
+        producer_thread = threading.Thread(
+            target=audio_producer,
+            daemon=False
+        )
+
+        inference_thread = threading.Thread(
+            target=inference_worker,
+            daemon=False
+        )
+
+        post_threads = [
+            threading.Thread(
+                target=postprocess_consumer,
+                daemon=False
+            )
+            for _ in range(post_workers)
+        ]
+
+        print(
+            f"Pipeline started: "
+            f"load_workers={load_workers}, "
+            f"post_workers={post_workers}, "
+            f"audio_queue={audio_queue_size}, "
+            f"result_queue={result_queue_size}"
+        )
+
+        # Start all stages
+        for t in post_threads:
+            t.start()
+
+        inference_thread.start()
+        producer_thread.start()
+
+        # ============================================================
+        # Wait for completion
+        # ============================================================
+
+        producer_thread.join()
+        inference_thread.join()
+
+        for t in post_threads:
+            t.join()
+
+        # ============================================================
+        # Sort results
+        # ============================================================
+
+        # 多线程后处理完成顺序可能与原音频顺序不同
+        # 如果希望 JSON 顺序和 audio_files 一致，可以按路径排序
+        audio_order = {
+            path: i
+            for i, path in enumerate(audio_files)
+        }
+
+        simple_preds.sort(
+            key=lambda x: audio_order.get(x["audio_path"], 10**18)
+        )
+
+        labelstudio_tasks.sort(
+            key=lambda x: x.get("data", {}).get("audio", "")
+        )
+
+        # ============================================================
+        # Save final JSON
+        # ============================================================
+
+        save_json(
+            os.path.join(args.output_dir, args.pred_json),
+            {"items": simple_preds}
+        )
+
+        with open(
+            pred_labelstudio_json,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(
+                labelstudio_tasks,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        print(f"Saved aggregated simple predictions: {args.pred_json}")
+        print(f"Saved aggregated Label Studio JSON: {pred_labelstudio_json}")
+
+    else:
+        for audio_path in audio_files:
+            waveform = load_audio(audio_path, sample_rate,
+                                  audio_mode=audio_mode)
+            probs = infer_full_audio(
+                model=model,
+                waveform=waveform,
+                sample_rate=sample_rate,
+                frame_hop_sec=frame_hop_sec,
+                window_sec=window_sec,
+                overlap=args.overlap,
+                device=device,
+            )
+            pred_spans = frame_probs_to_spans(
+                probs=probs,
+                idx_to_label=idx_to_label,
+                frame_hop_sec=frame_hop_sec,
+                threshold=args.threshold,
+                min_duration_sec=args.min_duration,
+            )
+
+            audio_filename = os.path.basename(audio_path)
+            audio_stem = os.path.splitext(audio_filename)[0]
+            gt_spans = load_gt_spans(args.annotations, audio_filename)
+
+            timeline_out = os.path.join(
+                args.output_dir, f"{audio_stem}_{model_name}.png")
+            waveform_plot = waveform[0] if waveform.dim() == 2 else waveform
+            if args.plot_timeline:
+                plot_timeline(
+                    waveform=waveform_plot.cpu().numpy(),
+                    sr=sample_rate,
+                    gt_spans=gt_spans,
+                    pred_spans=pred_spans,
+                    output_path=timeline_out,
+                    title=f"SED Timeline: {audio_filename}",
+                    plot_waveform=False
+                )
+
+            if args.save_pred_clips:
+                clip_dir = os.path.join(
+                    args.output_dir, "pred_clips", audio_stem)
+                save_predicted_audio_clips(
+                    waveform=waveform,
+                    sample_rate=sample_rate,
+                    pred_spans=pred_spans,
+                    clip_root=clip_dir,
+                )
+
+            simple_preds.append(
+                {
+                    "audio": audio_filename,
+                    "audio_path": audio_path,
+                    "pred_spans": pred_spans,
+                }
+            )
+
+            audio_uri = to_labelstudio_audio_uri(audio_path)
+            labelstudio_tasks.append(
+                build_labelstudio_task(
+                    audio_uri=audio_uri,
+                    pred_spans=pred_spans,
+                    original_length=float(waveform.shape[-1] / sample_rate),
+                    from_name=args.labelstudio_from_name,
+                    to_name=args.labelstudio_to_name,
+                    prediction_id=pred_id,
+                    completed_by=args.labelstudio_completed_by,
+                    origin=args.labelstudio_origin,
+                    model_name=model_name
+                )
+            )
+            pred_id += 1
+            print(f"Processed: {audio_path} -> {timeline_out}")
+
+            save_json(os.path.join(args.output_dir, args.pred_json),
+                      {"items": simple_preds})
+
+            with open(pred_labelstudio_json, "w", encoding="utf-8") as f:
+                json.dump(labelstudio_tasks, f, ensure_ascii=False, indent=2)
+
+        print(f"Saved aggregated simple predictions: {args.pred_json}")
+        print(f"Saved aggregated Label Studio JSON: {pred_labelstudio_json}")
 
 
 if __name__ == "__main__":

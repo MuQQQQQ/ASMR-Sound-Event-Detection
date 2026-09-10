@@ -61,9 +61,9 @@ if __name__ == '__main__':
         description='Convert Label Studio JSON to SED CSV'
     )
     parser.add_argument(
-        '--input', default='data/anno6.json', help='input JSON file path')
+        '--input', default='mono_data_all\\3.json', help='input JSON file path')
     parser.add_argument(
-        '--output', default='data/anno6.csv', help='output CSV path')
+        '--output', default='mono_data_all\\3.csv', help='output CSV path')
 
     args = parser.parse_args()
     convert_labelstudio_json_to_csv(args.input, args.output)

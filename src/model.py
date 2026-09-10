@@ -158,6 +158,8 @@ class UNetConformerSED(nn.Module):
             hop_length=hop_length,
             n_mels=n_mels,
             power=2.0,
+            f_min=20,
+            f_max=8000
         )
         self.db = torchaudio.transforms.AmplitudeToDB(top_db=80)
 
@@ -479,22 +481,16 @@ class ResNetConformerSED(nn.Module):
 
 
 class EMA:
-    """Exponential Moving Average (EMA) wrapper for model parameters."""
-
     def __init__(self, model, decay=0.999):
-        """Initialize EMA state."""
         self.model = model
         self.decay = decay
         self.shadow = {}
         self.backup = {}
-
-        # 初始化影子参数：将当前模型参数克隆一份
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
 
     def update(self):
-        """Update shadow parameters after one optimization step."""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 assert name in self.shadow
@@ -503,14 +499,12 @@ class EMA:
                 self.shadow[name] = new_average.clone()
 
     def apply_shadow(self):
-        """Apply EMA shadow weights to model (typically before validation)."""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone()
                 param.data.copy_(self.shadow[name])
 
     def restore(self):
-        """Restore original model weights after EMA evaluation."""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 param.data.copy_(self.backup[name])

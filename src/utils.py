@@ -4,16 +4,46 @@ import json
 import os
 from typing import Dict, List, Tuple
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torchaudio
+from matplotlib.ticker import FuncFormatter, MultipleLocator
+
+matplotlib.use("Agg")
+CLASSES = [
+    "Speech",
+    "Chewing",
+    "Mouth_Sounds",
+    "Breathing",
+    "Water_Bottle",
+    #"Slime",
+    "Rub",
+    "Scrub",
+    "Rasp"
+]
+color_map_255 = {
+    "Speech":       (239, 83, 80),     # 红
+    "Chewing":      (255, 145, 55),    # 橙
+    "Mouth_Sounds": (250, 200, 55),    # 黄
+    "Breathing":    (90, 195, 105),    # 绿
+    "Water_Bottle": (50, 190, 195),    # 青
+    "Slime":        (60, 135, 230),    # 蓝
+    "Rub":          (105, 90, 220),     # 蓝紫
+    "Scrub":        (175, 80, 210),    # 紫
+    "Rasp":         (225, 75, 155),    # 粉紫
+}
+# to hex
+color_map = {k: '#%02x%02x%02x' % v for k, v in color_map_255.items()}
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 
 # Labels that are excluded during training/evaluation data loading.
-DEFAULT_DISABLED_LABELS = {"Scraping", "Tapping", "Breathing", "Water_Bottle"}
+DEFAULT_DISABLED_LABELS = {"Scraping", "Tapping",
+                           "Breathing", "Water_Bottle", "Slime"}
+DEFAULT_DISABLED_LABELS = {}
 
 
 def name_to_color(name: str) -> str:
@@ -37,11 +67,13 @@ def load_annotations(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def build_label_map(df: pd.DataFrame) -> Tuple[Dict[str, int], Dict[int, str]]:
+def build_label_map(df: pd.DataFrame, virtual_classes=0) -> Tuple[Dict[str, int], Dict[int, str]]:
     """Build bidirectional mappings between class labels and indices."""
-    labels = sorted(df["event_label"].unique().tolist())
+    labels = CLASSES + \
+        [f"virtual_{i}" for i in range(virtual_classes)]
     label_to_idx = {lb: i for i, lb in enumerate(labels)}
     idx_to_label = {i: lb for lb, i in label_to_idx.items()}
+
     return label_to_idx, idx_to_label
 
 
@@ -81,7 +113,8 @@ def load_audio(path: str, target_sr: int, audio_mode: str = "mono") -> torch.Ten
 
     if sr != target_sr:
         if wav.dim() == 1:
-            wav = torchaudio.functional.resample(wav.unsqueeze(0), sr, target_sr).squeeze(0)
+            wav = torchaudio.functional.resample(
+                wav.unsqueeze(0), sr, target_sr).squeeze(0)
         else:
             wav = torchaudio.functional.resample(wav, sr, target_sr)
     return wav
@@ -176,48 +209,113 @@ def plot_timeline(
     pred_spans: List[Dict],
     output_path: str,
     title: str = "SED Timeline",
+    plot_waveform: bool = True,
 ):
     """Plot waveform + ground-truth spans + predicted spans as a timeline image."""
+
     duration = len(waveform) / sr
     t = np.arange(len(waveform)) / sr
 
-    fig, axes = plt.subplots(3, 1, figsize=(16, 9), sharex=True)
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=(24, 10),
+        sharex=True,
+    )
 
-    axes[0].plot(t, waveform, color="steelblue", linewidth=0.7)
-    axes[0].set_ylabel("Amplitude")
-    axes[0].set_title(title)
-    axes[0].grid(alpha=0.2)
-    all_labels = sorted({s["event_label"] for s in gt_spans + pred_spans})
+    if plot_waveform:
+        axes[0].plot(
+            t,
+            waveform,
+            color="steelblue",
+            linewidth=0.7,
+        )
+        axes[0].set_ylabel("Amplitude")
+        axes[0].set_title(title)
+        axes[0].grid(alpha=0.2)
 
-    def draw_spans(ax, spans, span_title, labels=all_labels):
+    def draw_spans(ax, spans, span_title, labels=None):
         """Draw horizontal labeled time spans on a given axis."""
-        labels = labels if labels else sorted(
-            {s["event_label"] for s in spans})
+
         y_map = {lb: i for i, lb in enumerate(labels)}
 
         for s in spans:
-            if s["event_label"] not in y_map:
+            label = s["event_label"]
+
+            if label not in y_map:
                 continue
-            y = y_map[s["event_label"]]
+
+            y = y_map[label]
+
             ax.broken_barh(
                 [(s["start_time"], s["end_time"] - s["start_time"])],
                 (y - 0.4, 0.8),
-                facecolors=name_to_color(s["event_label"]),
-                edgecolors="black",
+                facecolors=color_map.get(label, "#888888"),
+
                 linewidth=0.3,
             )
+
         ax.set_yticks(list(y_map.values()))
         ax.set_yticklabels(labels)
-        ax.set_ylim(-1, len(labels) + 0.5)
+
+        # Y轴：第一个类别在最上面
+        ax.set_ylim(-1, len(labels) - 0.5)
+        ax.invert_yaxis()
+
+        # Y轴文字使用对应类别的颜色
+        for text, label in zip(ax.get_yticklabels(), labels):
+            text.set_color(color_map.get(label, "#888888"))
+            text.set_fontweight("bold")
+
         ax.set_xlim(0, duration)
         ax.set_title(span_title)
         ax.grid(alpha=0.2, axis="x")
 
-    draw_spans(axes[1], gt_spans, "Ground Truth Spans")
-    draw_spans(axes[2], pred_spans, "Predicted Spans")
+    draw_spans(
+        axes[1],
+        gt_spans,
+        "Ground Truth Spans",
+        labels=CLASSES,
+    )
 
-    axes[2].set_xlabel("Time (s)")
+    draw_spans(
+        axes[2],
+        pred_spans,
+        "Predicted Spans",
+        labels=CLASSES,
+    )
+
+    # =========================
+    # X-axis: seconds -> M'SS"
+    # =========================
+
+    def format_time(seconds, pos):
+        seconds = int(round(seconds))
+        minutes = seconds // 60
+        seconds = seconds % 60
+
+        if minutes == 0:
+            return f'{seconds}"'
+
+        return f"{minutes}'{seconds:02d}\""
+
+    time_formatter = FuncFormatter(format_time)
+
+    for ax in axes:
+        ax.xaxis.set_major_locator(MultipleLocator(20))
+        ax.xaxis.set_major_formatter(time_formatter)
+
+    axes[2].set_xlabel("Time (min:s)")
+
     plt.tight_layout()
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, dpi=150)
+
+    os.makedirs(
+        os.path.dirname(output_path),
+        exist_ok=True,
+    )
+
+    plt.savefig(
+        output_path,
+        dpi=150,
+    )
+
     plt.close(fig)
