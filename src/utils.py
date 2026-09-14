@@ -19,7 +19,7 @@ CLASSES = [
     "Mouth_Sounds",
     "Breathing",
     "Water_Bottle",
-    #"Slime",
+    "Slime",
     "Rub",
     "Scrub",
     "Rasp"
@@ -153,6 +153,56 @@ def spans_to_frame_targets(
     return y
 
 
+def frame_probs_to_spans_np(
+    probs: np.ndarray,
+    idx_to_label: Dict[int, str],
+    frame_hop_sec: float,
+    threshold: float = 0.5,
+    min_duration_sec: float = 0.0,
+) -> List[Dict]:
+    """Convert frame-level probabilities to merged event spans by class."""
+    t, c = probs.shape
+    spans = []
+
+    min_frames = int(np.ceil(min_duration_sec / frame_hop_sec))
+
+    for cls in range(c):
+        active = probs[:, cls] >= threshold
+        if not active.any():
+            continue
+        changes = np.diff(active.astype(np.int8))
+        starts = np.flatnonzero(changes == 1) + 1
+        ends = np.flatnonzero(changes == -1) + 1
+
+        if active[0]:
+            starts = np.r_[0, starts]
+
+        if active[-1]:
+            ends = np.r_[ends, t]
+
+        lengths = ends - starts
+        mask = lengths >= min_frames
+
+        starts = starts[mask]
+        ends = ends[mask]
+
+        if len(starts) == 0:
+            continue
+
+        label = idx_to_label[cls]
+
+        for s, e in zip(starts, ends):
+            spans.append({
+                "event_label": label,
+                "start_time": float(s * frame_hop_sec),
+                "end_time": float(e * frame_hop_sec),
+                "score": float(probs[s:e, cls].mean()),
+            })
+
+    spans.sort(key=lambda x: (x["start_time"], x["event_label"]))
+    return spans
+
+
 def frame_probs_to_spans(
     probs: np.ndarray,
     idx_to_label: Dict[int, str],
@@ -163,6 +213,8 @@ def frame_probs_to_spans(
     """Convert frame-level probabilities to merged event spans by class."""
     spans: List[Dict] = []
     t, c = probs.shape
+    min_frames = int(np.ceil(min_duration_sec / frame_hop_sec))
+
     for cls in range(c):
         active = probs[:, cls] >= threshold
         i = 0
@@ -176,7 +228,7 @@ def frame_probs_to_spans(
             e = i
             st_sec = s * frame_hop_sec
             ed_sec = e * frame_hop_sec
-            if (ed_sec - st_sec) >= min_duration_sec:
+            if (e - s) >= min_frames:
                 spans.append(
                     {
                         "event_label": idx_to_label[cls],
@@ -303,6 +355,7 @@ def plot_timeline(
     for ax in axes:
         ax.xaxis.set_major_locator(MultipleLocator(20))
         ax.xaxis.set_major_formatter(time_formatter)
+        ax.tick_params(axis='x', labelrotation=30)  # 倾斜30度
 
     axes[2].set_xlabel("Time (min:s)")
 
