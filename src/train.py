@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import math
 import os
 import platform
@@ -15,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from sklearn.metrics import average_precision_score
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -100,7 +102,10 @@ def build_model(args, num_classes: int, device: str, checkpoint: str = None):
             audio_channels=audio_channels,
             conformer_layers=4,
             conformer_heads=4,
-            conformer_dim=256
+            conformer_dim=256,
+            f_max=args.f_max,
+            kernel_size=args.kernel_size,
+            use_cnn=args.use_cnn
         ).to(device)
 
     else:
@@ -119,6 +124,29 @@ def build_model(args, num_classes: int, device: str, checkpoint: str = None):
         payload_state_dict = payload.get("model_state_dict", payload)
         model.load_state_dict(payload_state_dict, strict=False)
     return model
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+
+        # [B, T, C] -> 对 B、T 两个维度求和，保留类别维 C
+        intersection = (probs * targets).sum(dim=(0, 1))
+        pred_sum = probs.sum(dim=(0, 1))
+        target_sum = targets.sum(dim=(0, 1))
+
+        dice = (
+            2.0 * intersection + self.smooth
+        ) / (
+            pred_sum + target_sum + self.smooth
+        )
+
+        # 每个类别先独立计算 Dice，再对类别求平均
+        return 1.0 - dice.mean()
 
 
 def build_criterion(loss_type: str):
@@ -141,6 +169,8 @@ def build_criterion(loss_type: str):
         return torch.nn.BCEWithLogitsLoss()
     elif loss_type == "weighted":
         return torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    elif loss_type == "dice":
+        return DiceLoss()
 
     def focal_loss(logits, targets, alpha=0.25, gamma=2.0):
         bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -269,16 +299,14 @@ def validate(
     amp_enabled=False,
     amp_dtype=torch.float16,
     ema=None,
-    virtual_classes=0
+    virtual_classes=0,
 ):
     model.eval()
-
     if ema is not None:
         ema.apply_shadow()
 
     total_loss = 0.0
     n = 0
-
     all_probs = []
     all_targets = []
 
@@ -288,7 +316,8 @@ def validate(
             dtype=amp_dtype,
             enabled=amp_enabled,
         )
-        if amp_enabled else nullcontext()
+        if amp_enabled
+        else nullcontext()
     )
 
     pbar = tqdm(loader, desc="val", leave=False)
@@ -305,6 +334,7 @@ def validate(
             loss = criterion(logits, y)
 
         probs = torch.sigmoid(logits)
+
         if virtual_classes != 0:
             probs = probs[:, :, :-virtual_classes]
             y = y[:, :, :-virtual_classes]
@@ -330,54 +360,26 @@ def validate(
     probs = probs.reshape(-1, probs.shape[-1])
     targets = targets.reshape(-1, targets.shape[-1])
 
-    ap = average_precision_score(
-        targets,
-        probs,
-        average=None,
-    )
+    # Binary prediction
+    threshold = 0.5
+    preds = probs >= threshold
+    targets_bool = targets.astype(bool)
 
-    map_score = np.nanmean(ap)
+    # Per-class Dice
+    tp = np.logical_and(preds, targets_bool).sum(axis=0)
+    fp = np.logical_and(preds, ~targets_bool).sum(axis=0)
+    fn = np.logical_and(~preds, targets_bool).sum(axis=0)
 
-    thresholds = np.linspace(0.05, 1, 30)
-    f1s = np.zeros(len(thresholds))
-    ps = np.zeros(len(thresholds))
-    rs = np.zeros(len(thresholds))
-    best_f1 = 0.0
-    best_threshold = 0.5
-    for i, threshold in enumerate(thresholds):
-        preds = probs >= threshold
+    dice = 2.0 * tp / (2.0 * tp + fp + fn + 1e-8)
 
-        targets_bool = targets.astype(bool)
+    # Mean Dice across classes
+    mean_dice = np.nanmean(dice)
 
-        tp = np.logical_and(preds, targets_bool).sum(axis=0)
-        fp = np.logical_and(preds, ~targets_bool).sum(axis=0)
-        fn = np.logical_and(~preds, targets_bool).sum(axis=0)
-
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-        macro_precision = np.nanmean(precision)
-        macro_recall = np.nanmean(recall)
-        macro_f1 = np.nanmean(f1)
-
-        f1s[i] = macro_f1
-        ps[i] = macro_precision
-        rs[i] = macro_recall
-        if macro_f1 > best_f1:
-            best_f1 = macro_f1
-            best_threshold = threshold
-
-    ziped = (thresholds, f1s, ps, rs)
     return (
         total_loss / max(1, n),
-        float(map_score),
-        float(macro_precision),
-        float(macro_recall),
-        float(macro_f1),
-        ap,
-        ziped,
-        best_threshold,
+        float(mean_dice),
+        dice,
+        threshold,
     )
 
 
@@ -385,11 +387,10 @@ def plot_loss(
     train_loss_history,
     val_loss_history,
     lr_history,
-    val_map_history,
-    val_ap_history,
+    val_mean_dice_history,
+    val_dice_history,
     idx_to_label,
     log_dir,
-    f1s
 ):
     plt.figure(figsize=(10, 8))
 
@@ -402,22 +403,22 @@ def plot_loss(
     plt.plot(val_loss_history, label="Val Loss", color="#ff820eff")
 
     plt.xlabel("Epoch")
-    plt.ylim(0, 0.005)
+    # plt.ylim(0, 0.005)
     plt.ylabel("Loss")
     plt.title("Loss Curves")
     plt.legend()
     plt.grid()
 
     # =========================
-    # 2. mAP
+    # 2. mDICE
     # =========================
     plt.subplot(2, 2, 2)
 
-    plt.plot(val_map_history, label="Val mAP", color="#d8907eff")
+    plt.plot(val_mean_dice_history, label="Val mDICE", color="#d8907eff")
 
-    if val_map_history:
+    if val_mean_dice_history:
         best_epoch, best_map = max(
-            enumerate(val_map_history),
+            enumerate(val_mean_dice_history),
             key=lambda x: x[1],
         )
 
@@ -437,18 +438,18 @@ def plot_loss(
         )
 
     plt.xlabel("Epoch")
-    plt.ylabel("mAP")
+    plt.ylabel("mDICE")
     plt.ylim(0, 1)
 
-    plt.title("Validation mAP")
+    plt.title("Validation mDICE")
     plt.grid()
 
     # =========================
-    # 3. Per-class AP
+    # 3. Per-class DICE
     # =========================
     plt.subplot(2, 2, 3)
 
-    ap_history = np.asarray(val_ap_history)
+    ap_history = np.asarray(val_dice_history)
 
     for idx in range(ap_history.shape[1]):
         label = idx_to_label[idx]
@@ -460,19 +461,16 @@ def plot_loss(
         )
 
     plt.xlabel("Epoch")
-    plt.ylabel("AP")
+    plt.ylabel("DICE")
     plt.ylim(0, 1)
-    plt.title("Per-class AP")
+    plt.title("Per-class DICE")
     plt.legend(fontsize=8, loc='upper left')
     plt.grid()
 
-    # plot ziped f1s
     plt.subplot(2, 2, 4)
-    plt.plot(f1s[0], f1s[1], label='F1')
-    plt.plot(f1s[0], f1s[2], label='Precision')
-    plt.plot(f1s[0], f1s[3], label='Recall')
+    plt.plot(lr_history, label='LR')
 
-    plt.xlabel("Threshold")
+    plt.xlabel("LR")
     plt.legend()
     plt.tight_layout()
 
@@ -492,8 +490,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="mono_data_all")
     ap.add_argument("--annotations", type=str,
-                    default="mono_data_all/1.csv,mono_data_all/2.csv,mono_data_all/3.csv")
-    # "data/anno.csv,data/annotations.csv,data/anno3.csv,data/anno4.csv,data/anno5.csv,data/anno6.csv,data/anno7.csv"
+                    default="mono_data_all/*.csv")
     ap.add_argument("--sample_rate", type=int, default=16000)
     ap.add_argument("--window_sec", type=float, default=10.0)
     ap.add_argument("--frame_hop_sec", type=float, default=0.02)
@@ -501,9 +498,10 @@ def main():
     ap.add_argument("--batch_size", type=int, default=30)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--val_ratio", type=float, default=0.2)
+    ap.add_argument("--val_ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--checkpoint", type=str, default="")
+    ap.add_argument("--kernel_size", type=int, default=3)
     ap.add_argument("--use_specaug", action="store_true", default=False)
     ap.add_argument("--use_mixup", action="store_true", default=False)
     ap.add_argument("--freq_mask_param", type=int, default=20)
@@ -511,6 +509,7 @@ def main():
     ap.add_argument("--log_dir", type=str, default="mono_logs")
     ap.add_argument("--feature_extractor", type=str,
                     default="melspec", choices=["wav2vec2", "melspec", 'panns', 'fbank'])
+    ap.add_argument("--use_cnn", action="store_true")
     ap.add_argument("--amp", dest="amp", action="store_true")
     ap.add_argument("--amp_dtype", type=str, default="bfloat16",
                     choices=["float16", "bfloat16"])
@@ -522,7 +521,7 @@ def main():
                     choices=["cosine", "step", "custom", "none"])
 
     ap.add_argument("--loss_type", type=str, default="bce",
-                    choices=["bce", "focal", "weighted"])
+                    choices=["bce", "focal", "weighted", "dice"])
     ap.add_argument("--n_fft", type=int, default=1024)
 
     ap.add_argument("--win_length", type=int, default=1024)
@@ -540,13 +539,15 @@ def main():
     ap.add_argument("--virtual_classes", type=int, default=1)
     ap.add_argument("--dataset_type", type=str,
                     default='group', choices=["slice", "group"])
+    ap.add_argument("--audio_norm", action="store_true")
     # early stop 296 4min
     ap.add_argument("--early_stop_patience", type=int, default=30)
+    ap.add_argument("--f_max", type=int, default=8000)
     args = ap.parse_args()
 
     args.batches_per_group = int(0.5*args.files_per_batch *
                                  args.windows_per_file // args.batch_size)
-    print(f"Calculated batches_per_group: {args.batches_per_group}")
+    # print(f"Calculated batches_per_group: {args.batches_per_group}")
     current_time = time.localtime()
     # log_dir = os.path.join(
     #     args.log_dir, time.strftime("%Y%m%d-%H%M%S", current_time))
@@ -568,14 +569,18 @@ def main():
     print(f"Using device: {device}")
     print(f"AMP enabled: {amp_enabled} (dtype={args.amp_dtype})")
 
-    annotation_files = args.annotations.split(",")
+    annotation_files = []
+    for pattern in args.annotations.split(","):
+        pattern = pattern.strip()
+        matches = glob.glob(pattern)
+        if not matches:
+            raise FileNotFoundError(f"No annotation files found: {pattern}")
+        annotation_files.extend(matches)
+    # print(annotation_files)
     total_df = []
     for af in annotation_files:
-        if not os.path.exists(af):
-            raise FileNotFoundError(f"Annotation file not found: {af}")
         df = load_annotations(af)
         total_df.append(df)
-
     df = pd.concat(total_df, ignore_index=True)
     label_to_idx, idx_to_label = build_label_map(df, args.virtual_classes)
     files = sorted(df["filename"].unique().tolist())
@@ -585,9 +590,13 @@ def main():
     # train_files = ['out000.mp3', 'out001.mp3', 'out003.mp3',
     #                'out004.mp3', 'out005.mp3', 'out006.mp3']
     # val_files = ['out002.mp3', 'out007.mp3']
-    print(f"Classes ({len(label_to_idx)}): {list(label_to_idx.keys())}")
-    print(f"Train files: {train_files}, {len(train_files)}")
-    print(f"Val files: {val_files}, {len(val_files)}")
+
+    print(
+        f"\033[38;2;140;230;170mClasses ({len(label_to_idx)}): {list(label_to_idx.keys())}")
+    print(
+        f"\033[38;2;210;170;255mTrain files: {train_files}, {len(train_files)}")
+    print(f"\033[38;2;140;220;220mVal files: {val_files}, {len(val_files)}")
+    print('\033[0m')
     executor = ThreadPoolExecutor(max_workers=4)
     futures = []
     if args.dataset_type == 'group':
@@ -604,6 +613,7 @@ def main():
             seed=args.seed,
             audio_mode=args.audio_mode,
             use_lazy_loading=args.use_lazy_loading,
+            norm=args.audio_norm
         )
     elif args.dataset_type == 'slice':
         # 不必在意
@@ -626,9 +636,10 @@ def main():
         eval_hop_sec=10,
         audio_mode=args.audio_mode,
         use_lazy_loading=False,
+        norm=args.audio_norm
     )
 
-    if args.files_per_batch > 0 and args.dataset_type == 'group':
+    if args.files_per_batch > 0 and args.dataset_type == 'group' and args.use_lazy_loading:
         train_batch_sampler = RandomFileSubsetBatchSampler(
             dataset=train_ds,
             batch_size=args.batch_size,
@@ -666,7 +677,7 @@ def main():
 
     criterion = build_criterion(args.loss_type)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr)
+        model.parameters(), lr=args.lr, weight_decay=1e-4)
     lr_scheduler = build_scheduler(args, optimizer, len(train_loader))
     scaler = None
     if amp_enabled:
@@ -680,9 +691,9 @@ def main():
     train_loss_history = []
     val_loss_history = []
     lr_history = []
-    val_map_history = []
+    val_mean_dice_history = []
     val_f1_history = []
-    val_ap_history = []
+    val_dice_history = []
     train_loader.dataset.use_mixup = args.use_mixup
     timer = time.time()
     for ep in range(1, args.epochs + 1):
@@ -704,7 +715,8 @@ def main():
             dataset_type=args.dataset_type,
             virtual_classes=args.virtual_classes
         )
-        va, val_map, val_precision, val_recall, val_f1, class_ap, f1s, best_threshold = validate(
+
+        va, mean_dice, dice, best_threshold = validate(
             model,
             val_loader,
             criterion,
@@ -719,18 +731,15 @@ def main():
             "epoch": ep,
             "train_loss": tr,
             "val_loss": va,
-            "val_map": val_map,
-            "val_precision": val_precision,
-            "val_recall": val_recall,
-            "val_f1": val_f1,
-            "class_ap": class_ap.tolist(),
+            "mean_dice": mean_dice,
+            "dice": dice.tolist(),
             "best_threshold": best_threshold,
         })
 
         train_loss_history.append(tr)
         val_loss_history.append(va)
-        val_map_history.append(val_map)
-        val_ap_history.append(class_ap)
+        val_mean_dice_history.append(mean_dice)
+        val_dice_history.append(dice)
         lr_history.append(lr_scheduler.get_last_lr()[
                           0] if lr_scheduler else None)
         # clear memory
@@ -746,21 +755,20 @@ def main():
         eta_minutes, eta_seconds = divmod(rem, 60)
 
         print(
-            f"E {ep:03d}: t_loss={tr:.4f} v_loss={va:.4f}, mAP={val_map:.4f}, best_threshold={best_threshold:.2f}, lr={lr_scheduler.get_last_lr()[0] if lr_scheduler else 'N/A':.6f}. Time elapsed: {int(used_hours):02d}:{int(used_minutes):02d}:{int(used_seconds):02d}. ETA: {int(eta_hours):02d}:{int(eta_minutes):02d}:{int(eta_seconds):02d}")
+            f"\033[38;2;130;200;255mE {ep:03d}: t_loss={tr:.4f} v_loss={va:.4f}, mDICE={mean_dice:.4f}, best_threshold={best_threshold:.2f}, lr={lr_scheduler.get_last_lr()[0] if lr_scheduler else 'N/A':.6f}. Time elapsed: {int(used_hours):02d}:{int(used_minutes):02d}:{int(used_seconds):02d}. ETA: {int(eta_hours):02d}:{int(eta_minutes):02d}:{int(eta_seconds):02d}\033[0m")
         # plot_loss(train_loss_history,val_loss_history,lr_history,val_map_history,val_ap_history,idx_to_label,log_dir,f1s )
         executor.submit(
             plot_loss,
             train_loss_history,
             val_loss_history,
             lr_history,
-            val_map_history,
-            val_ap_history,
+            val_mean_dice_history,
+            val_dice_history,
             idx_to_label,
             log_dir,
-            f1s if f1s is not None else None,
         )
-        if val_map > best_val:
-            best_val = val_map
+        if mean_dice > best_val:
+            best_val = mean_dice
             if args.use_ema:
                 state_dict = model.state_dict()
 
@@ -784,7 +792,7 @@ def main():
             save_checkpoint(os.path.join(
                 log_dir, "best_checkpoint.pth"), payload)
             print(
-                f"Saved best checkpoint to {os.path.join(log_dir, 'best_checkpoint.pth')}")
+                f"\033[1;38;2;0;0;0;48;2;0;255;0mSaved best checkpoint to {os.path.join(log_dir, 'best_checkpoint.pth')}\033[0m")
 
     save_json(os.path.join(log_dir, "history.json"), {"history": history})
     if args.use_ema:
@@ -808,7 +816,7 @@ def main():
 
     save_checkpoint(os.path.join(
         log_dir, "last_checkpoint.pth"), payload)
-    print("Training done.")
+    print("\033[1;38;2;0;0;0;48;2;255;128;0mTraining done.\033[0m")
     executor.shutdown(wait=True)
     return best_val
 

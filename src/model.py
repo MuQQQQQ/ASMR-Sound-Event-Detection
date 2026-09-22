@@ -9,14 +9,14 @@ import torchaudio.compliance.kaldi as kaldi
 class ResBlock2D(nn.Module):
     """Basic 2D residual block used in spectrogram CNN encoder."""
 
-    def __init__(self, in_ch: int, out_ch: int, stride=(1, 1)):
+    def __init__(self, in_ch: int, out_ch: int, stride=(1, 1), kernel_size=3):
         """Initialize residual block layers."""
         super().__init__()
         self.conv1 = nn.Conv2d(
-            in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
+            in_ch, out_ch, kernel_size=kernel_size, stride=stride, padding=kernel_size//2)
         self.bn1 = nn.BatchNorm2d(out_ch)
         self.conv2 = nn.Conv2d(
-            out_ch, out_ch, kernel_size=3, stride=1, padding=1)
+            out_ch, out_ch, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
         self.bn2 = nn.BatchNorm2d(out_ch)
         self.act = nn.ReLU(inplace=True)
         self.down = None
@@ -332,6 +332,9 @@ class ResNetConformerSED(nn.Module):
         use_wenet=False,
         use_wenet_ckpt=True,
         audio_channels: int = 1,
+        f_max=8000,
+        kernel_size=3,
+        use_cnn=True
     ):
         """Initialize ResNetConformerSED model components."""
         super().__init__()
@@ -350,21 +353,26 @@ class ResNetConformerSED(nn.Module):
             n_mels=n_mels,
             power=2.0,
             norm='slaney',
-            mel_scale='slaney'
+            mel_scale='slaney',
+            f_min=20,
+            f_max=8000
         )
         self.db = torchaudio.transforms.AmplitudeToDB(top_db=80)
+        self.use_cnn = use_cnn
+        if use_cnn:
+            self.cnn_stem = nn.Sequential(
+                nn.Conv2d(audio_channels, 32, kernel_size=3,
+                          stride=(1, 1), padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+            )
 
-        self.cnn_stem = nn.Sequential(
-            nn.Conv2d(audio_channels, 32, kernel_size=3,
-                      stride=(1, 1), padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-        )
-        self.cnn = nn.Sequential(
-            ResBlock2D(32, 64, stride=(2, 1)),
-            ResBlock2D(64, 128, stride=(2, 1)),
-            ResBlock2D(128, 128, stride=(1, 1)),
-        )
+            self.cnn = nn.Sequential(
+                ResBlock2D(32, 64, stride=(2, 1), kernel_size=kernel_size),
+                ResBlock2D(64, 128, stride=(2, 1), kernel_size=kernel_size),
+                #ResBlock2D(128, 128, stride=(2, 1), kernel_size=kernel_size),
+                ResBlock2D(128, 128, stride=(1, 1), kernel_size=kernel_size),
+            )
 
         if feature_extractor == "melspec":
             proj_dim = 128
@@ -374,6 +382,8 @@ class ResNetConformerSED(nn.Module):
             proj_dim = 256
         elif feature_extractor == "fbank":
             proj_dim = 128
+        if not use_cnn:
+            proj_dim = 64
         self.proj = nn.Sequential(
             nn.Linear(proj_dim, conformer_dim),
             nn.Dropout(dropout),
@@ -454,12 +464,15 @@ class ResNetConformerSED(nn.Module):
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """Forward pass producing frame-wise event logits."""
-        x = self.extract_features(waveform)
+        x = self.extract_features(waveform)  # [30,1,64,501]
         if self.feature_extractor == "melspec":
-            x = self.cnn_stem(x)
-            x = self.cnn(x)  # [B, C, M', T]
-            x = x.mean(dim=2)  # [B, C, T]
-            x = x.transpose(1, 2)  # [B, T, C]
+            if self.use_cnn:
+                x = self.cnn_stem(x)  # [30,32,64,501]
+                x = self.cnn(x)  # [30,128,16,501]
+                x = x.mean(dim=2)  # [30, 128, 501]
+            else:
+                x = x.squeeze(1)
+            x = x.transpose(1, 2)  # [30, 501, 128]
         elif self.feature_extractor == "wav2vec2":
             pass
         elif self.feature_extractor == "fbank":

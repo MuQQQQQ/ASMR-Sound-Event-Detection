@@ -238,7 +238,7 @@ out001.mp3,10.50,12.20,Breathing
 一个典型的训练命令如下：
 
 ```bash
-python src/train.py --data_dir data --annotations data/anno.csv --amp --virtual_classes 50 --loss_type focal --lr_scheduler cosine --lr 1e-4 --batch_size 30 --dataset_type group --sample_rate 16000 --n_fft 1024 --hop_length 320 --win_length 1024 --n_mels 64 --use_ema --epochs 100
+python src/train.py --data_dir data --annotations data/anno.csv --amp --virtual_classes 50 --loss_type dice --lr_scheduler cosine --lr 1e-4 --batch_size 30 --dataset_type group --sample_rate 16000 --n_fft 1024 --hop_length 320 --win_length 1024 --n_mels 64 --use_ema --epochs 100 --use_cnn
 ```
 
 这里使用的主要配置包括：
@@ -249,10 +249,11 @@ n_fft       : 1024
 hop length  : 320
 window      : 1024
 Mel bands   : 64
-Loss        : Focal Loss
+Loss        : DICE Loss
 Scheduler   : Cosine
 EMA         : Enabled
 AMP         : Enabled
+use cnn     : Enabled
 Epochs      : 100
 ```
 
@@ -286,6 +287,14 @@ python src/train.py \
 
 ## 6.2 常用训练参数
 
+### use cnn
+
+```bash
+--use_cnn
+```
+
+在Conformer之前使用CNN来提取特征。
+
 ### EMA
 
 ```bash
@@ -297,15 +306,16 @@ python src/train.py \
 ### Loss
 
 ```bash
---loss_type {bce,focal}
+--loss_type {bce,focal,dice}
 ```
 
 支持：
 
 * `bce`：Binary Cross Entropy
 * `focal`：Focal Loss
+* `dice`: DICE Loss
 
-对于类别分布不均衡的 SED 数据，Focal Loss 可以降低大量容易分类样本对训练的影响。
+对于类别分布不均衡的 SED 数据，Focal Loss 和 DICE Loss 可以降低大量容易分类样本对训练的影响。
 
 ### Learning Rate Scheduler
 
@@ -786,7 +796,7 @@ Multiple labels may overlap in time, allowing multi-label sound event detection.
 A typical training command is:
 
 ```bash
-python src/train.py --data_dir data --annotations data/anno.csv --amp --virtual_classes 50 --loss_type focal --lr_scheduler cosine --lr 1e-4 --batch_size 30 --dataset_type group --sample_rate 16000 --n_fft 1024 --hop_length 320 --win_length 1024 --n_mels 64 --use_ema --epochs 100
+python src/train.py --data_dir data --annotations data/anno.csv --amp --virtual_classes 50 --loss_type dice --lr_scheduler cosine --lr 1e-4 --batch_size 30 --dataset_type group --sample_rate 16000 --n_fft 1024 --hop_length 320 --win_length 1024 --n_mels 64 --use_ema --epochs 100 --use_cnn
 ```
 
 Example configuration:
@@ -797,11 +807,12 @@ n_fft       : 1024
 hop length  : 320
 window      : 1024
 Mel bands   : 64
-Loss        : Focal Loss
+Loss        : DICE Loss
 Scheduler   : Cosine
 EMA         : Enabled
 AMP         : Enabled
 Epochs      : 100
+use cnn     : Enabled
 ```
 
 ### Virtual Classes
@@ -835,6 +846,13 @@ All referenced audio files must be located under the same `data_dir`.
 ---
 
 ## 6.2 Common Training Parameters
+### use cnn
+
+```bash
+--use_cnn
+```
+
+Use a CNN to extract features before the Conformer.
 
 ### EMA
 
@@ -847,15 +865,16 @@ Enables Exponential Moving Average of model parameters, which can provide a more
 ### Loss Function
 
 ```bash
---loss_type {bce,focal}
+--loss_type {bce,focal,dice}
 ```
 
 Supported losses:
 
 * `bce`: Binary Cross Entropy
 * `focal`: Focal Loss
+* `dice`: DICE Loss
 
-Focal Loss can be useful for imbalanced SED datasets because it reduces the contribution of a large number of easy negative examples.
+Focal Loss and DICE Loss can be useful for imbalanced SED datasets because it reduces the contribution of a large number of easy negative examples.
 
 ### Learning Rate Scheduler
 

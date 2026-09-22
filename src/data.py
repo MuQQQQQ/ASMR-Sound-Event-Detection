@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 import os
 import random
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 
 import numpy as np
@@ -13,6 +16,25 @@ import torchcodec
 from torch.utils.data import Dataset, Sampler
 
 from utils import format_audio_channels, spans_to_frame_targets
+
+
+def audio_norm(x, target_db=-25.0, eps=1e-5):
+    target_rms = 10 ** (target_db / 20)
+
+    # First normalization
+    rms = torch.sqrt(torch.mean(x.square()))
+    x = x * target_rms / (rms + eps)
+
+    # Estimate RMS from high-energy samples
+    power = x.square()
+    mean_power = power.mean()
+    mask = power > mean_power
+
+    if mask.any():
+        rms = torch.sqrt(power[mask].mean())
+        x = x * target_rms / (rms + eps)
+
+    return x
 
 
 class SEDWindowDataset(Dataset):
@@ -39,10 +61,18 @@ class SEDWindowDataset(Dataset):
         mixup_prob: float = 0.5,
         audio_mode: str = "mono",
         use_lazy_loading: bool = True,
+        norm=False
     ):
         """Initialize dataset with selectable lazy/eager loading."""
         self.data_dir = data_dir
         self.annotations = annotations
+        self.annotation_groups = {
+            fn: [
+                (float(r.start_time), float(r.end_time), str(r.event_label))
+                for r in sdf.itertuples(index=False)
+            ]
+            for fn, sdf in self.annotations.groupby("filename")
+        }
         self.files = files
         self.label_to_idx = label_to_idx
         self.sample_rate = sample_rate
@@ -57,6 +87,8 @@ class SEDWindowDataset(Dataset):
         self.audio_mode = audio_mode
         self.audio_channels = 2 if audio_mode == "stereo" else 1
         self.use_lazy_loading = bool(use_lazy_loading)
+        self._loader_pool = ThreadPoolExecutor(max_workers=4)
+        self.norm = norm
 
         self.window_samples = int(round(window_sec * sample_rate))
         self.num_frames = int(math.ceil(window_sec / frame_hop_sec))
@@ -67,46 +99,27 @@ class SEDWindowDataset(Dataset):
         self.file_to_wav = {}
         self._active_file_to_wav: Dict[str, torch.Tensor] = {}
 
-        for fn in self.files:
-            path = os.path.join(self.data_dir, fn)
-
-            metadata = torchcodec.decoders.AudioDecoder(path).metadata
-            orig_sr = int(metadata.sample_rate)
-            num_frames = int(metadata.duration_seconds * orig_sr)
-            if num_frames <= 0:
-                wav_full, sr_full = torchaudio.load(path)
-                orig_sr = int(sr_full)
-                num_frames = int(wav_full.shape[-1])
-
-            duration = float(num_frames / max(1, orig_sr))
-            self.file_meta[fn] = {
-                "path": path,
-                "orig_sr": orig_sr,
-                "num_frames": num_frames,
-            }
-            self.file_durations[fn] = duration
-
-            sdf = self.annotations[self.annotations["filename"] == fn]
-            spans = [
-                (float(r.start_time), float(r.end_time), str(r.event_label))
-                for r in sdf.itertuples(index=False)
-            ]
-            self.file_to_spans[fn] = spans
-
-        if not self.use_lazy_loading:
-            for fn in self.files:
-                self.file_to_wav[fn] = self._load_full_processed(fn)
+        self._init_files()
 
         self.index = []
-
+        pattern = re.compile(r"^\d{3}_[LR]\.mp3$")
+        total_dur = 0
         if self.training or not full_audio_eval:
             for fn in self.files:
                 n = self.windows_per_file if self.training else 20
+                dur = self.file_durations.get(fn, 10*60)
+                total_dur += dur
+
+                # print(fn, dur)
+                n = max(int(dur)//30, 2)*5
+                if pattern.match(fn):
+                    n *= 2
                 for i in range(n):
                     self.index.append((fn, i))
         else:
             for fn in self.files:
                 dur = self.file_durations[fn]
+                total_dur += dur
                 stride = eval_hop_sec
                 max_start = max(0.0, dur - self.window_sec)
 
@@ -121,6 +134,60 @@ class SEDWindowDataset(Dataset):
 
                 for st in starts:
                     self.index.append((fn, st))
+        print(
+            f'\033[1;38;2;255;255;255;48;2;50;130;200m【 DATA 】\033[0mtotal duration: {int(total_dur)//3600}h{(int(total_dur)//60)%60}m{int(total_dur)%60}s')
+
+    def _read_file_info(self, fn):
+        path = os.path.join(self.data_dir, fn)
+
+        metadata = torchcodec.decoders.AudioDecoder(path).metadata
+        orig_sr = int(metadata.sample_rate)
+        num_frames = int(metadata.duration_seconds * orig_sr)
+
+        if num_frames <= 0:
+            wav_full, sr_full = torchaudio.load(path)
+            orig_sr = int(sr_full)
+            num_frames = int(wav_full.shape[-1])
+            del wav_full
+
+        # sdf = self.annotations[self.annotations["filename"] == fn]
+        # spans = [
+        #     (float(r.start_time), float(r.end_time), str(r.event_label))
+        #     for r in sdf.itertuples(index=False)
+        # ]
+        spans = self.annotation_groups.get(fn, [])
+        return fn, path, orig_sr, num_frames, spans
+
+    def _load_full_file(self, fn):
+        return fn, self._load_full_processed(fn)
+
+    def _init_files(self):
+        print('\033[1;38;2;255;255;255;48;2;50;130;200m【 DATA 】\033[0mLoading...')
+        t = time.time()
+        max_workers = 10
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for fn, path, orig_sr, num_frames, spans in executor.map(
+                self._read_file_info,
+                self.files,
+            ):
+                self.file_meta[fn] = {
+                    "path": path,
+                    "orig_sr": orig_sr,
+                    "num_frames": num_frames,
+                }
+                self.file_durations[fn] = num_frames / max(1, orig_sr)
+                self.file_to_spans[fn] = spans
+
+        if not self.use_lazy_loading:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for fn, wav in executor.map(
+                    self._load_full_file,
+                    self.files,
+                ):
+                    self.file_to_wav[fn] = wav
+        print('\033[1;38;2;255;255;255;48;2;50;130;200m【 DATA 】\033[0mLoaded.',
+              f'Used {time.time()-t:.2f}s')
 
     def __len__(self):
         """Return number of indexed windows."""
@@ -156,25 +223,31 @@ class SEDWindowDataset(Dataset):
         return wav.float()
 
     def set_active_files(self, active_files: List[str]):
-        """Preload only selected files for current batch into memory.
-
-        This is designed to be called by a custom batch sampler before yielding
-        batch indices.
-        """
         if not self.use_lazy_loading:
             return
 
-        selected = {fn for fn in active_files if fn in self.file_meta}
+        selected = {
+            fn for fn in active_files
+            if fn in self.file_meta
+        }
+
         if not selected:
             self._active_file_to_wav = {}
             return
 
-        new_cache: Dict[str, torch.Tensor] = {}
-        for fn in selected:
-            if fn in self._active_file_to_wav:
-                new_cache[fn] = self._active_file_to_wav[fn]
-            else:
-                new_cache[fn] = self._load_full_processed(fn)
+        old_cache = self._active_file_to_wav
+        new_cache = {}
+
+        def load_file(fn):
+            if fn in old_cache:
+                return fn, old_cache[fn]
+            return fn, self._load_full_processed(fn)
+
+        futures = self._loader_pool.map(load_file, selected)
+
+        for fn, wav in futures:
+            new_cache[fn] = wav
+
         self._active_file_to_wav = new_cache
 
     def _load_clip_from_full(self, wav: torch.Tensor, st: float) -> torch.Tensor:
@@ -245,7 +318,8 @@ class SEDWindowDataset(Dataset):
             clip = self._load_clip_lazy(fn, st)
         else:
             clip = self._load_clip_from_full(self.file_to_wav[fn], st)
-
+        if self.norm:
+            clip = audio_norm(clip)
         ed = st + self.window_sec
 
         y = spans_to_frame_targets(
@@ -264,8 +338,11 @@ class SEDWindowDataset(Dataset):
         """Check whether an index metadata item behaves like a float start time."""
         return hasattr(value, "__float__")
 
+    def __del__(self):
+        if hasattr(self, "_loader_pool"):
+            self._loader_pool.shutdown(wait=False)
+
     def __getitem__(self, idx):
-        """Fetch one sample and optionally apply mixup augmentation."""
 
         fn, meta = self.index[idx]
 
@@ -276,9 +353,6 @@ class SEDWindowDataset(Dataset):
 
         clip, target = self._get_clip(fn, st)
 
-        # =========================
-        # Mixup
-        # =========================
         if (
             self.training
             and self.use_mixup
@@ -313,8 +387,12 @@ def split_files(all_files: List[str], val_ratio: float = 0.2, seed: int = 42):
     rnd = random.Random(seed)
     rnd.shuffle(files)
     n_val = max(1, int(round(len(files) * val_ratio))) if len(files) > 1 else 0
-    val_files = files[:n_val]
-    train_files = files[n_val:] if n_val > 0 else files
+    if n_val == 1:
+        val_files = files[:20]
+        train_files = files
+    else:
+        val_files = files[:n_val]
+        train_files = files[n_val:] if n_val > 0 else files
     if not train_files:
         train_files = files
         val_files = files
@@ -322,24 +400,6 @@ def split_files(all_files: List[str], val_ratio: float = 0.2, seed: int = 42):
 
 
 class RandomFileSubsetBatchSampler(Sampler):
-    """Sample each batch from a random subset of files.
-
-    For each batch, pick `files_per_batch` files, ask dataset to preload only
-    those files into memory, then sample indices from the chosen files.
-    """
-
-
-class RandomFileSubsetBatchSampler(Sampler):
-    """
-    Improved version:
-    Each selected file subset persists for multiple batches.
-
-    Args:
-        dataset
-        batch_size
-        files_per_batch
-        batches_per_group: number of batches to use same file subset
-    """
 
     def __init__(
         self,
@@ -367,12 +427,9 @@ class RandomFileSubsetBatchSampler(Sampler):
 
     def __iter__(self):
         batch_count = 0
-
         while batch_count < self.num_batches:
-
             k = min(self.files_per_batch, len(self.files))
             chosen_files = random.sample(self.files, k=k)
-
             self.dataset.set_active_files(chosen_files)
 
             pool = []
@@ -381,13 +438,10 @@ class RandomFileSubsetBatchSampler(Sampler):
 
             if not pool:
                 continue
-
             for _ in range(self.batches_per_group):
-
                 if batch_count >= self.num_batches:
                     break
-
                 batch = [random.choice(pool) for _ in range(self.batch_size)]
                 yield batch
-
+                batch_count += 1
                 batch_count += 1
